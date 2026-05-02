@@ -293,6 +293,18 @@ function ensureBunInstalled(): void {
   }
 }
 
+export function buildBunPathEnv(
+  existingPath = process.env.PATH ||
+    "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+  homeDir = homedir(),
+): string {
+  return [join(homeDir, ".bun", "bin"), existingPath].join(":");
+}
+
+export function bunExecutableName(): string {
+  return "bun";
+}
+
 function resolveDaemonMainPath(assistantIndex: string): string {
   return join(dirname(assistantIndex), "daemon", "main.ts");
 }
@@ -383,6 +395,7 @@ async function startDaemonFromSource(
 
   const env: Record<string, string | undefined> = {
     ...process.env,
+    PATH: buildBunPathEnv(process.env.PATH || ""),
     RUNTIME_HTTP_PORT: process.env.RUNTIME_HTTP_PORT || "7821",
     VELLUM_CLOUD: "local",
     VELLUM_DEV: "1",
@@ -418,13 +431,13 @@ async function startDaemonFromSource(
   writeFileSync(pidFile, "starting", "utf-8");
 
   const child = foreground
-    ? spawn("bun", ["run", daemonMainPath], {
+    ? spawn(bunExecutableName(), ["run", daemonMainPath], {
         stdio: "inherit",
         env,
       })
     : (() => {
         const daemonLogFd = openLogFile("hatch.log");
-        const c = spawn("bun", ["run", daemonMainPath], {
+        const c = spawn(bunExecutableName(), ["run", daemonMainPath], {
           detached: true,
           stdio: ["ignore", "pipe", "pipe"],
           env,
@@ -515,6 +528,7 @@ async function startDaemonWatchFromSource(
 
   const env: Record<string, string | undefined> = {
     ...process.env,
+    PATH: buildBunPathEnv(process.env.PATH || ""),
     RUNTIME_HTTP_PORT: process.env.RUNTIME_HTTP_PORT || "7821",
     VELLUM_DEV: "1",
     VELLUM_ENVIRONMENT: process.env.VELLUM_ENVIRONMENT || "local",
@@ -549,7 +563,7 @@ async function startDaemonWatchFromSource(
   writeFileSync(pidFile, "starting", "utf-8");
 
   const daemonLogFd = openLogFile("hatch.log");
-  const child = spawn("bun", ["--watch", "run", mainPath], {
+  const child = spawn(bunExecutableName(), ["--watch", "run", mainPath], {
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
     env,
@@ -1239,7 +1253,7 @@ export async function startGateway(
       ? ["--watch", "run", "src/index.ts", "--vellum-gateway"]
       : ["run", "src/index.ts", "--vellum-gateway"];
     const gwLogFd = openLogFile("hatch.log");
-    gateway = spawn("bun", bunArgs, {
+    gateway = spawn(bunExecutableName(), bunArgs, {
       cwd: gatewayDir,
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],

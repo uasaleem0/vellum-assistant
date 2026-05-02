@@ -1,8 +1,13 @@
-import { existsSync, readFileSync, unlinkSync } from "fs";
-import { homedir } from "os";
-import { join } from "path";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+} from "fs";
+import { dirname, join } from "path";
 
-import { saveAssistantEntry } from "../lib/assistant-config";
+import { getBaseDir, saveAssistantEntry } from "../lib/assistant-config";
 import type { AssistantEntry } from "../lib/assistant-config";
 import {
   generateLocalSigningKey,
@@ -11,6 +16,22 @@ import {
 } from "../lib/local";
 import { getArchivePath, getMetadataPath } from "../lib/retire-archive";
 import { exec } from "../lib/step-runner";
+
+export function getRecoverRestorePath(
+  entry: AssistantEntry,
+  baseDir = getBaseDir(),
+): string {
+  if (!entry.resources) {
+    throw new Error(`Assistant '${entry.assistantId}' is missing resources.`);
+  }
+  return entry.resources.instanceDir === baseDir
+    ? join(entry.resources.instanceDir, ".vellum")
+    : entry.resources.instanceDir;
+}
+
+export function getRecoverArchiveStagingDir(name: string): string {
+  return `${getArchivePath(name)}.staging`;
+}
 
 export async function recover(): Promise<void> {
   const args = process.argv.slice(3);
@@ -52,7 +73,7 @@ export async function recover(): Promise<void> {
   }
 
   // 3. Check that the recovering entry's own target directory is free.
-  const target = join(entry.resources.instanceDir, ".vellum");
+  const target = getRecoverRestorePath(entry);
   if (existsSync(target)) {
     console.error(
       `Error: ${target} already exists (owned by ${entry.assistantId}). ` +
@@ -61,11 +82,16 @@ export async function recover(): Promise<void> {
     process.exit(1);
   }
 
-  // 4. Extract archive
-  // TODO: extraction target is hardcoded to homedir(); multi-instance entries
-  //       whose instanceDir differs from homedir will extract to the wrong
-  //       location. Tracked separately from the collision-check regression.
-  await exec("tar", ["xzf", archivePath, "-C", homedir()]);
+  // 4. Extract archive staging directory and move it back to the original path.
+  const stagingDir = getRecoverArchiveStagingDir(name);
+  if (existsSync(stagingDir)) {
+    throw new Error(
+      `Cannot recover '${name}': archive staging directory already exists at ${stagingDir}.`,
+    );
+  }
+  await exec("tar", ["xzf", archivePath, "-C", dirname(stagingDir)]);
+  mkdirSync(dirname(target), { recursive: true });
+  renameSync(stagingDir, target);
 
   // 5. Restore lockfile entry
   saveAssistantEntry(entry);

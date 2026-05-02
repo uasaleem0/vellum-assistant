@@ -34,13 +34,20 @@ import {
   enqueueGraphTriggerEmbed,
   searchGraphNodes,
 } from "./graph-search.js";
-import { applyDiff, createEdge, getNodesByIds, queryNodes } from "./store.js";
+import {
+  applyDiff,
+  createEdge,
+  getNode,
+  getNodesByIds,
+  queryNodes,
+} from "./store.js";
 import type {
   DecayCurve,
   EmotionalCharge,
   Fidelity,
   ImageRef,
   MemoryDiff,
+  MemoryNode,
   MemoryType,
   NewEdge,
   NewNode,
@@ -583,6 +590,77 @@ export interface DeferredEdge {
   weight: number;
 }
 
+type NodeLookup = (id: string) => MemoryNode | null;
+
+function inheritedDurabilityChanges(
+  newNode: MemoryNode | NewNode,
+  oldNode: MemoryNode,
+): Partial<Omit<MemoryNode, "id">> {
+  return {
+    stability: Math.max(newNode.stability, oldNode.stability),
+    reinforcementCount: Math.max(
+      newNode.reinforcementCount,
+      oldNode.reinforcementCount,
+    ),
+    significance: Math.max(newNode.significance, oldNode.significance),
+    eventDate: newNode.eventDate ?? oldNode.eventDate,
+    imageRefs: newNode.imageRefs ?? oldNode.imageRefs,
+  };
+}
+
+function mergeNodeUpdate(
+  diff: MemoryDiff,
+  id: string,
+  changes: Partial<Omit<MemoryNode, "id">>,
+): void {
+  const existing = diff.updateNodes.find((update) => update.id === id);
+  if (existing) {
+    existing.changes = { ...existing.changes, ...changes };
+    return;
+  }
+  diff.updateNodes.push({ id, changes });
+}
+
+export function inheritSupersessionDurability(
+  diff: MemoryDiff,
+  deferredEdges: DeferredEdge[],
+  lookupNode: NodeLookup = getNode,
+): void {
+  // For new->existing supersession, inherit the existing node's earned
+  // durability into the new node spec before applyDiff creates it.
+  for (const de of deferredEdges) {
+    if (de.relationship !== "supersedes") continue;
+    if (de.source.kind !== "new" || de.target.kind !== "existing") continue;
+
+    const oldNode = lookupNode(de.target.nodeId);
+    if (!oldNode) continue;
+
+    const newNodeSpec = diff.createNodes[de.source.newNodeIndex];
+    if (!newNodeSpec) continue;
+
+    diff.createNodes[de.source.newNodeIndex] = {
+      ...newNodeSpec,
+      ...inheritedDurabilityChanges(newNodeSpec, oldNode),
+    };
+  }
+
+  // For existing->existing supersession, add inheritance to the diff itself so
+  // the update remains part of applyDiff's transaction.
+  for (const edge of diff.createEdges) {
+    if (edge.relationship !== "supersedes") continue;
+
+    const oldNode = lookupNode(edge.targetNodeId);
+    const newNode = lookupNode(edge.sourceNodeId);
+    if (!oldNode || !newNode) continue;
+
+    mergeNodeUpdate(
+      diff,
+      edge.sourceNodeId,
+      inheritedDurabilityChanges(newNode, oldNode),
+    );
+  }
+}
+
 export function parseExtractionResponse(
   input: Record<string, unknown>,
   conversationId: string,
@@ -1098,20 +1176,7 @@ export async function runGraphExtraction(
   );
 
   // 7. Handle supersession (inherit durability before applying diff)
-  // TODO: full supersession is not yet implemented. When it lands, iterate
-  // BOTH `diff.createEdges` (existing → existing) AND `deferredEdges`
-  // (new → existing, the typical supersession case).
-  // Tracked by https://github.com/vellum-ai/vellum-assistant/pull/27057 (Devin).
-  for (const edge of diff.createEdges) {
-    if (edge.relationship === "supersedes") {
-      // Placeholder — see TODO above.
-    }
-  }
-  for (const de of deferredEdges) {
-    if (de.relationship === "supersedes") {
-      // Placeholder — see TODO above.
-    }
-  }
+  inheritSupersessionDurability(diff, deferredEdges);
 
   // 8. Apply the diff
   const result = applyDiff(diff, { conversationId });

@@ -77,6 +77,16 @@ import { handleVerificationIntercept } from "./inbound-stages/verification-inter
 
 const log = getLogger("runtime-http");
 
+type TranscribeAudioAttachments = typeof tryTranscribeAudioAttachments;
+let transcribeAudioAttachments: TranscribeAudioAttachments =
+  tryTranscribeAudioAttachments;
+
+export function __setTranscribeAudioAttachmentsForTesting(
+  fn?: TranscribeAudioAttachments,
+): void {
+  transcribeAudioAttachments = fn ?? tryTranscribeAudioAttachments;
+}
+
 // Delete-lookup retry configuration. Delete webhooks can race ahead of
 // the inbound handler's `linkMessage` call when the original message's
 // agent loop is still running. Retrying buys time for the link to land
@@ -438,8 +448,7 @@ export async function handleChannelInbound(
 
     // Auto-transcribe audio attachments from channel messages
     if (sourceChannel) {
-      const transcribeResult =
-        await tryTranscribeAudioAttachments(attachmentIds);
+      const transcribeResult = await transcribeAudioAttachments(attachmentIds);
       switch (transcribeResult.status) {
         case "transcribed":
           // For voice-only messages (empty content), this becomes the message text.

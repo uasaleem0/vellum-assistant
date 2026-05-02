@@ -28,10 +28,6 @@ let mockTranscribeResult:
   | { status: "no_provider"; reason: string }
   | { status: "error"; reason: string } = { status: "no_audio" };
 
-mock.module("../runtime/routes/inbound-stages/transcribe-audio.js", () => ({
-  tryTranscribeAudioAttachments: mock(async () => mockTranscribeResult),
-}));
-
 import { eq } from "drizzle-orm";
 
 import { upsertContact } from "../contacts/contact-store.js";
@@ -42,11 +38,14 @@ import { resetTestTables } from "../memory/raw-query.js";
 import { attachments, conversationAttentionEvents } from "../memory/schema.js";
 import * as pendingInteractions from "../runtime/pending-interactions.js";
 import { handleChannelInbound } from "../runtime/routes/channel-routes.js";
+import { __setTranscribeAudioAttachmentsForTesting } from "../runtime/routes/inbound-message-handler.js";
 
 initializeDb();
 
 afterAll(() => {
+  __setTranscribeAudioAttachmentsForTesting();
   resetDb();
+  mock.restore();
 });
 
 // ---------------------------------------------------------------------------
@@ -69,6 +68,7 @@ function resetTables(): void {
   );
   deliveryChannels.resetAllRunDeliveryClaims();
   pendingInteractions.clear();
+  __setTranscribeAudioAttachmentsForTesting(async () => mockTranscribeResult);
 }
 
 function ensureTestContact(): void {

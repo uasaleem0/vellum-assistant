@@ -45,14 +45,19 @@ function sanitizePreviewValue(value: string): string {
   return escapeBackticks(redactSecrets(value));
 }
 
-function formatToolInputPreview(
+export function formatToolInputPreview(
   toolName: string,
   toolInput: Record<string, unknown>,
 ): string | null {
-  // Pick the most relevant field based on tool type
+  // Prefer human-readable activity description over raw command/path
+  const activity = toolInput.activity;
+  if (typeof activity === "string" && activity.trim().length > 0) {
+    return truncatePreview(sanitizePreviewValue(activity.trim()));
+  }
+
   const command = toolInput.command ?? toolInput.cmd;
   if (typeof command === "string" && command.length > 0) {
-    return truncatePreview(`\`${sanitizePreviewValue(command)}\``);
+    return truncatePreview(`running \`${sanitizePreviewValue(command)}\``);
   }
 
   const path = toolInput.path ?? toolInput.file_path ?? toolInput.filePath;
