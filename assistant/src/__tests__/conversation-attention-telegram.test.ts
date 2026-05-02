@@ -21,6 +21,17 @@ mock.module("../daemon/handlers/shared.js", () => ({
   }),
 }));
 
+let mockTranscribeResult:
+  | { status: "transcribed"; text: string }
+  | { status: "no_audio" }
+  | { status: "disabled" }
+  | { status: "no_provider"; reason: string }
+  | { status: "error"; reason: string } = { status: "no_audio" };
+
+mock.module("../runtime/routes/inbound-stages/transcribe-audio.js", () => ({
+  tryTranscribeAudioAttachments: mock(async () => mockTranscribeResult),
+}));
+
 import { eq } from "drizzle-orm";
 
 import { upsertContact } from "../contacts/contact-store.js";
@@ -113,6 +124,7 @@ beforeEach(() => {
   resetTables();
   ensureTestContact();
   noopProcessMessage.mockClear();
+  mockTranscribeResult = { status: "no_audio" };
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -149,6 +161,50 @@ describe("Telegram inbound message seen signals", () => {
     expect(events[0].sourceChannel).toBe("telegram");
     expect(events[0].source).toBe("inbound-message-handler");
     expect(events[0].evidenceText).toBe("User sent message: 'Hello there!'");
+  });
+
+  test("voice attachment is transcribed before processing and raw audio is stripped", async () => {
+    const db = getDb();
+    const audioAttachmentId = `voice-${Date.now()}`;
+    db.insert(attachments)
+      .values({
+        id: audioAttachmentId,
+        originalFilename: "voice.ogg",
+        mimeType: "audio/ogg",
+        sizeBytes: 1024,
+        kind: "base64",
+        dataBase64: "T2dnUw==",
+        createdAt: Date.now(),
+      })
+      .run();
+
+    mockTranscribeResult = {
+      status: "transcribed",
+      text: "Please investigate the loop issue.",
+    };
+    const processMessage = mock(async () => ({ messageId: "voice-msg-1" }));
+
+    const res = await handleChannelInbound(
+      makeInboundRequest({
+        content: "",
+        attachmentIds: [audioAttachmentId],
+      }),
+      processMessage,
+      TEST_BEARER_TOKEN,
+    );
+    const body = (await res.json()) as Record<string, unknown>;
+
+    expect(body.accepted).toBe(true);
+    expect(body.duplicate).toBe(false);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(processMessage).toHaveBeenCalledTimes(1);
+    const processMessageCalls = processMessage.mock.calls as unknown[][];
+    expect(processMessageCalls[0]![1]).toContain(
+      "Please investigate the loop issue.",
+    );
+    expect(processMessageCalls[0]![2]).toBeUndefined();
   });
 
   test("records inferred seen signal for media attachment without text", async () => {

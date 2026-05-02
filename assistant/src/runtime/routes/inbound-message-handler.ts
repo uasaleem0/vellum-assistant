@@ -192,6 +192,9 @@ export async function handleChannelInbound(
   let trimmedContent = typeof content === "string" ? content.trim() : "";
   const hasAttachments =
     Array.isArray(attachmentIds) && attachmentIds.length > 0;
+  let effectiveAttachmentIds: string[] = hasAttachments
+    ? [...attachmentIds]
+    : [];
 
   const hasCallbackData =
     typeof body.callbackData === "string" && body.callbackData.length > 0;
@@ -432,28 +435,46 @@ export async function handleChannelInbound(
         { status: 400 },
       );
     }
-  }
 
-  // Auto-transcribe audio attachments from channel messages
-  if (hasAttachments && sourceChannel) {
-    const transcribeResult = await tryTranscribeAudioAttachments(attachmentIds);
-    switch (transcribeResult.status) {
-      case "transcribed":
-        // For voice-only messages (empty content), this becomes the message text.
-        // For audio+caption, both are preserved.
-        trimmedContent =
-          transcribeResult.text +
-          (trimmedContent ? `\n\n${trimmedContent}` : "");
-        break;
-      case "no_provider":
-      case "error":
-        // Inject a hint so the assistant knows the user sent audio and why
-        // transcription failed — it can then guide the user (e.g. set up API key).
-        trimmedContent =
-          `[Voice message received — ${transcribeResult.reason}]` +
-          (trimmedContent ? `\n\n${trimmedContent}` : "");
-        break;
-      // "no_audio", "disabled" — no action needed
+    // Auto-transcribe audio attachments from channel messages
+    if (sourceChannel) {
+      const transcribeResult =
+        await tryTranscribeAudioAttachments(attachmentIds);
+      switch (transcribeResult.status) {
+        case "transcribed":
+          // For voice-only messages (empty content), this becomes the message text.
+          // For audio+caption, both are preserved.
+          trimmedContent =
+            transcribeResult.text +
+            (trimmedContent ? `\n\n${trimmedContent}` : "");
+          break;
+        case "no_provider":
+        case "error":
+          // Inject a hint so the assistant knows the user sent audio and why
+          // transcription failed — it can then guide the user (e.g. set up API key).
+          trimmedContent =
+            `[Voice message received — ${transcribeResult.reason}]` +
+            (trimmedContent ? `\n\n${trimmedContent}` : "");
+          break;
+        // "no_audio", "disabled" — no action needed
+      }
+      // Strip audio attachments when transcription ran (regardless of outcome).
+      // The audio content is now in trimmedContent (transcript or error hint).
+      // Keeping raw audio file blocks causes Anthropic to warn on every LLM
+      // step and emit a binary placeholder instead of the actual voice content.
+      if (
+        transcribeResult.status !== "no_audio" &&
+        transcribeResult.status !== "disabled"
+      ) {
+        const audioIds = new Set(
+          resolved
+            .filter((a) => a.mimeType.startsWith("audio/"))
+            .map((a) => a.id),
+        );
+        effectiveAttachmentIds = effectiveAttachmentIds.filter(
+          (id) => !audioIds.has(id),
+        );
+      }
     }
   }
 
@@ -1090,7 +1111,10 @@ export async function handleChannelInbound(
         conversationId: result.conversationId,
         eventId: result.eventId,
         content: contentForProcessing,
-        attachmentIds: hasAttachments ? attachmentIds : undefined,
+        attachmentIds:
+          effectiveAttachmentIds.length > 0
+            ? effectiveAttachmentIds
+            : undefined,
         sourceChannel,
         sourceInterface,
         externalChatId: conversationExternalId,
