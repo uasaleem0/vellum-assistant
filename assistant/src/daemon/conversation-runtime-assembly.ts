@@ -961,7 +961,7 @@ export function buildUnifiedTurnContextBlock(
   // Response discretion for non-vellum channels.
   if (options.channelName && options.channelName !== "vellum") {
     lines.push(
-      `response_discretion: Not every message in a channel thread requires your response. If a message is clearly not directed at you (e.g. people talking among themselves, acknowledgements, reactions), output exactly <no_response/> as your entire reply to stay silent.`,
+      `response_discretion: For direct one-to-one channel messages, assume the current user message is directed at you and reply. Not every message in a channel thread requires your response; if a message is clearly not directed at you (e.g. group chatter, people talking among themselves, acknowledgements, reactions), output exactly <no_response/> as your entire reply to stay silent. Never output <no_response/> for explicit prompts, questions, corrections, "reply", or "why didn't you reply".`,
     );
   }
 

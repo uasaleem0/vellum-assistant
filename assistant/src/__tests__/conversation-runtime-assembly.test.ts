@@ -1159,9 +1159,7 @@ describe("buildUnifiedTurnContextBlock", () => {
     expect(text).toContain("member_policy: allow");
     // Behavioral guidance: conversational confirmation (one-time decision pattern)
     expect(text).toContain("trusted contact (non-guardian)");
-    expect(text).toContain(
-      "confirming the guardian's intent conversationally",
-    );
+    expect(text).toContain("confirming the guardian's intent conversationally");
     expect(text).not.toContain(
       "tool execution layer will automatically deny it and escalate",
     );
@@ -1209,6 +1207,12 @@ describe("buildUnifiedTurnContextBlock", () => {
     expect(vellumText).not.toContain("response_discretion:");
     expect(telegramText).toContain("response_discretion:");
     expect(telegramText).toContain("<no_response/>");
+    expect(telegramText).toContain(
+      "For direct one-to-one channel messages, assume the current user message is directed at you and reply.",
+    );
+    expect(telegramText).toContain(
+      'Never output <no_response/> for explicit prompts, questions, corrections, "reply", or "why didn\'t you reply".',
+    );
   });
 
   test("dedup logic: fields matching canonical_actor_identity are omitted", () => {
