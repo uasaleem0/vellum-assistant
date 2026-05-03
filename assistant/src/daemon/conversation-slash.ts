@@ -2,6 +2,15 @@ import type { InterfaceId } from "../channels/types.js";
 import { getConfig } from "../config/loader.js";
 import { PROVIDER_CATALOG } from "../providers/model-catalog.js";
 import { getConfiguredProviders } from "../providers/provider-availability.js";
+import {
+  getConversationOverrideProfile,
+  setConversationInferenceProfile,
+} from "../memory/conversation-crud.js";
+import {
+  getUsageGroupBreakdown,
+  getUsageTotals,
+  type UsageTimeRange,
+} from "../memory/llm-usage-store.js";
 
 export type SlashResolution =
   | { kind: "passthrough"; content: string }
@@ -19,6 +28,7 @@ export interface SlashContext {
   provider: string;
   estimatedCost: number;
   userMessageInterface?: InterfaceId;
+  conversationId?: string;
 }
 
 // ── Deprecated model-switching shortcuts ─────────────────────────────
@@ -108,6 +118,9 @@ function resolveCommandsList(context?: SlashContext): string[] {
     "/commands — List all available commands",
     "/compact — Force context compaction immediately",
     "/models — List all available models",
+    "/profiles — List available inference profiles",
+    "/profile — Show or switch the current inference profile",
+    "/usage — Show LLM usage and cost breakdown",
   ];
   if (context) {
     fallbackLines.push("/status — Show conversation status and context usage");
@@ -176,9 +189,155 @@ export function classifySlash(
   if (trimmed === "/compact") return "compact";
   if (trimmed === "/status") return "unknown";
   if (trimmed === "/commands") return "unknown";
+  if (trimmed === "/profile" || trimmed.startsWith("/profile "))
+    return "unknown";
+  if (trimmed === "/profiles") return "unknown";
+  if (trimmed === "/usage") return "unknown";
   return "passthrough";
 }
 
+// ── Profile descriptions ───────────────────────────────────────────
+
+const PROFILE_DESCRIPTIONS: Record<string, string> = {
+  standard: "Gemini 2.5 Flash-Lite — fast, cheap, great for everyday tasks",
+  balanced: "Claude Haiku — warm, conversational, human-like responses",
+  quality: "Claude Sonnet — deep reasoning, coaching, complex tasks",
+  "cost-optimized": "Gemini 2.5 Flash-Lite (low effort) — background tasks",
+  analytics: "DeepSeek V3 — structured data analysis",
+  "deep-analysis": "DeepSeek R1 — step-by-step reasoning with thinking",
+};
+
+function resolveProfileCommand(
+  trimmed: string,
+  context?: SlashContext,
+): SlashResolution {
+  if (!context?.conversationId) {
+    return {
+      kind: "unknown",
+      message: "Profile switching is not available in this context.",
+    };
+  }
+
+  // /profiles — list all profiles (checked before extracting rest)
+  if (trimmed === "/profiles") {
+    const profiles = getConfig().llm?.profiles ?? {};
+    const current = getConversationOverrideProfile(context.conversationId);
+    const lines = ["Available inference profiles:\n"];
+    for (const name of Object.keys(profiles)) {
+      const desc = PROFILE_DESCRIPTIONS[name] ?? "Custom profile";
+      const marker = current === name ? " **[current]**" : "";
+      lines.push(`- **${name}**${marker} — ${desc}`);
+    }
+    if (!current) {
+      const active = getConfig().llm?.activeProfile ?? "default";
+      lines.push(`\nCurrent: **${active}** (workspace default)`);
+    }
+    lines.push("\nSwitch with `/profile <name>`");
+    return { kind: "unknown", message: lines.join("\n") };
+  }
+
+  const rest = trimmed.slice("/profile".length).trim();
+
+  // /profile — show current
+  if (rest === "") {
+    const current = getConversationOverrideProfile(context.conversationId);
+    const active = getConfig().llm?.activeProfile ?? "default";
+    const profiles = getConfig().llm?.profiles ?? {};
+    if (current && profiles[current]) {
+      const desc = PROFILE_DESCRIPTIONS[current] ?? "";
+      return {
+        kind: "unknown",
+        message: `Current profile: **${current}** — ${desc}
+
+Switch with \`/profile <name>\`. See all with \`/profiles\`.`,
+      };
+    }
+    const desc = PROFILE_DESCRIPTIONS[active] ?? "";
+    return {
+      kind: "unknown",
+      message: `Current profile: **${active}** (workspace default) — ${desc}
+
+Switch with \`/profile <name>\`. See all with \`/profiles\`.`,
+    };
+  }
+
+  // /profile <name> — switch
+  const profiles = getConfig().llm?.profiles ?? {};
+  if (!Object.prototype.hasOwnProperty.call(profiles, rest)) {
+    const available = Object.keys(profiles).join(", ");
+    return {
+      kind: "unknown",
+      message: `Unknown profile "${rest}". Available: ${available}`,
+    };
+  }
+
+  setConversationInferenceProfile(context.conversationId, rest);
+  const desc = PROFILE_DESCRIPTIONS[rest] ?? "";
+  return {
+    kind: "unknown",
+    message: `Switched to **${rest}** — ${desc}
+
+This conversation will now use this profile for the main agent. Background tasks continue using their dedicated profiles.`,
+  };
+}
+
+// ── /usage command ─────────────────────────────────────────────────
+
+function startOfDayUtc(ts: number): number {
+  const d = new Date(ts);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+function fmtCost(n: number): string {
+  if (n < 0.01) return `$${(n * 100).toFixed(2)}\u00a2`;
+  return `$${n.toFixed(2)}`;
+}
+
+function fmtTokens(n: number): string {
+  return n.toLocaleString("en-US");
+}
+
+function resolveUsageCommand(): SlashResolution {
+  const now = Date.now();
+  const todayStart = startOfDayUtc(now);
+  const dayAgo = now - 24 * 60 * 60 * 1000;
+
+  const todayRange: UsageTimeRange = { from: todayStart, to: now };
+  const dayRange: UsageTimeRange = { from: dayAgo, to: now };
+
+  const today = getUsageTotals(todayRange);
+  const last24h = getUsageTotals(dayRange);
+
+  const providerBreakdown = getUsageGroupBreakdown(todayRange, "provider");
+  const modelBreakdown = getUsageGroupBreakdown(todayRange, "model");
+
+  const lines: string[] = [
+    "LLM Usage\n",
+    `Today (UTC):   ${fmtTokens(today.totalInputTokens)} in / ${fmtTokens(today.totalOutputTokens)} out  —  ${fmtCost(today.totalEstimatedCostUsd)}`,
+    `Last 24h:      ${fmtTokens(last24h.totalInputTokens)} in / ${fmtTokens(last24h.totalOutputTokens)} out  —  ${fmtCost(last24h.totalEstimatedCostUsd)}`,
+    `LLM calls:     ${today.eventCount.toLocaleString("en-US")}`,
+  ];
+
+  if (providerBreakdown.length > 0) {
+    lines.push("\nBy Provider:");
+    for (const row of providerBreakdown.slice(0, 8)) {
+      lines.push(
+        `  ${row.group.padEnd(14)} ${fmtTokens(row.totalInputTokens)} in / ${fmtTokens(row.totalOutputTokens)} out  —  ${fmtCost(row.totalEstimatedCostUsd)}`,
+      );
+    }
+  }
+
+  if (modelBreakdown.length > 0) {
+    lines.push("\nBy Model:");
+    for (const row of modelBreakdown.slice(0, 8)) {
+      lines.push(
+        `  ${row.group.padEnd(30)} ${fmtTokens(row.totalInputTokens)} in / ${fmtTokens(row.totalOutputTokens)} out  —  ${fmtCost(row.totalEstimatedCostUsd)}`,
+      );
+    }
+  }
+
+  return { kind: "unknown", message: lines.join("\n") };
+}
 /**
  * Resolve built-in slash commands (/models, /status, /commands, /compact).
  * Returns `unknown` with a deterministic message, `compact` for forced compaction,
@@ -221,6 +380,20 @@ export async function resolveSlash(
   // Handle /compact command
   if (trimmed === "/compact") {
     return { kind: "compact" };
+  }
+
+  // Handle /profile and /profiles commands
+  if (
+    trimmed === "/profile" ||
+    trimmed.startsWith("/profile ") ||
+    trimmed === "/profiles"
+  ) {
+    return resolveProfileCommand(trimmed, context);
+  }
+
+  // Handle /usage command
+  if (trimmed === "/usage") {
+    return resolveUsageCommand();
   }
 
   // Handle /status command

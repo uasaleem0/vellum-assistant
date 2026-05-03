@@ -2179,6 +2179,7 @@ export async function handleSendMessage(
     provider: config.llm.default.provider,
     estimatedCost: conversation.usageStats.estimatedCost,
     userMessageInterface: sourceInterface,
+    conversationId: conversation.conversationId,
   };
   const slashResult = await resolveSlash(rawContent, slashContext);
 

@@ -249,10 +249,11 @@ export function classifySegment(
   registry: Record<string, CommandRiskSpec>,
   toolName: "bash" | "host_bash" = "bash",
 ): { risk: Risk; reason: string; matchType: RiskAssessment["matchType"] } {
-  // 1. Check user rules first (highest priority)
-  // TODO: implement user rule matching with specificity ordering.
-  // For now, userRules is always empty so this is a no-op.
-  for (const rule of userRules) {
+  // 1. Check user rules first (highest priority).
+  // Sort by specificity: longer patterns take precedence over shorter ones,
+  // so "rm /tmp/*" beats a catch-all "rm" rule when both match.
+  const sortedRules = userRules.slice().sort((a, b) => b.pattern.length - a.pattern.length);
+  for (const rule of sortedRules) {
     const re = getCompiledPattern(rule.pattern);
     if (re.test(segment.command)) {
       return { risk: rule.risk, reason: rule.label, matchType: "user_rule" };

@@ -262,6 +262,7 @@ function buildSlashContext(
     provider: config.llm.default.provider,
     estimatedCost: conversation.usageStats.estimatedCost,
     userMessageInterface: turnInterface?.userMessageInterface,
+    conversationId: conversation.conversationId,
   };
 }
 

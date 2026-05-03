@@ -331,6 +331,9 @@ export async function setTelegramCommands(
   const resolvedCommands = commands ?? [
     { command: "new", description: "Start a new conversation" },
     { command: "help", description: "Show available commands" },
+    { command: "profiles", description: "List available inference profiles" },
+    { command: "profile", description: "Show or switch inference profile" },
+    { command: "usage", description: "Show LLM usage and cost breakdown" },
   ];
 
   try {

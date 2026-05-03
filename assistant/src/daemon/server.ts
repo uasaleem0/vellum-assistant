@@ -1330,6 +1330,7 @@ export class DaemonServer {
       provider: config.llm.default.provider,
       estimatedCost: conversation.usageStats.estimatedCost,
       userMessageInterface: serverInterfaceCtx?.userMessageInterface,
+      conversationId: conversationId,
     };
     const slashResult = await resolveSlash(content, slashContext);
 
