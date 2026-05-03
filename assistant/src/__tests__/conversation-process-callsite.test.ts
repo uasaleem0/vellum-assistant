@@ -16,10 +16,16 @@ import type { Message, ProviderResponse } from "../providers/types.js";
 
 // Use an object wrapper so TypeScript doesn't narrow the captured type to
 // `undefined` based on the initial assignment in the test setup.
-const captured: { callSite?: string } = {};
+const captured: {
+  callSite?: string;
+  memoryRetrievalCalls: number;
+  runMessages: Message[];
+} = { memoryRetrievalCalls: 0, runMessages: [] };
 
 function clearCaptured(): void {
   captured.callSite = undefined;
+  captured.memoryRetrievalCalls = 0;
+  captured.runMessages = [];
 }
 
 mock.module("../util/logger.js", () => ({
@@ -161,6 +167,18 @@ mock.module("../memory/retriever.js", () => ({
   injectMemoryRecallAsUserBlock: (msgs: Message[]) => msgs,
 }));
 
+mock.module("../plugins/defaults/memory-retrieval.js", () => ({
+  asDefaultGraphPayload: () => null,
+  runDefaultMemoryRetrieval: async () => {
+    captured.memoryRetrievalCalls += 1;
+    return {
+      pkbContent: "expensive pkb context",
+      nowContent: "expensive now context",
+      memoryGraphBlocks: [],
+    };
+  },
+}));
+
 // Mock AgentLoop to capture the callSite argument that runAgentLoopImpl passes.
 // The 6th positional parameter is `callSite` (see assistant/src/agent/loop.ts).
 mock.module("../agent/loop.js", () => ({
@@ -181,6 +199,7 @@ mock.module("../agent/loop.js", () => ({
       callSite?: string,
     ): Promise<Message[]> {
       captured.callSite = callSite;
+      captured.runMessages = messages;
       onEvent({
         type: "usage",
         inputTokens: 0,
@@ -304,5 +323,40 @@ describe("processMessage callSite threading", () => {
     await conversation.processMessage("Plain user message", [], () => {});
 
     expect(captured.callSite).toBe("mainAgent");
+  });
+
+  test("uses lean direct-chat path for ordinary Telegram messages", async () => {
+    mockConversation = {
+      id: "conv-1",
+      contextSummary: null,
+      contextCompactedMessageCount: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalEstimatedCost: 0,
+    };
+    mockDbMessages = [];
+    clearCaptured();
+
+    const conversation = makeConversation();
+    conversation.setChannelCapabilities({
+      channel: "telegram",
+      dashboardCapable: false,
+      supportsDynamicUi: false,
+      supportsVoiceInput: false,
+      chatType: "private",
+    });
+    conversation.setTurnChannelContext({
+      userMessageChannel: "telegram",
+      assistantMessageChannel: "telegram",
+    });
+    await conversation.loadFromDb();
+
+    await conversation.processMessage("Plain Telegram message", [], () => {});
+
+    const renderedRunText = JSON.stringify(captured.runMessages);
+    expect(captured.callSite).toBe("mainAgent");
+    expect(captured.memoryRetrievalCalls).toBe(0);
+    expect(renderedRunText).not.toContain("expensive pkb context");
+    expect(renderedRunText).not.toContain("expensive now context");
   });
 });

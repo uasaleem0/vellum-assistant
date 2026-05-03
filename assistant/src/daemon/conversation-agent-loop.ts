@@ -135,6 +135,7 @@ import {
   approveHostAttachmentRead,
   resolveAssistantAttachments,
 } from "./conversation-attachments.js";
+import { resolveDirectChatCostPolicy } from "./conversation-cost-policy.js";
 import {
   buildConversationErrorMessage,
   classifyConversationError,
@@ -680,6 +681,15 @@ export async function runAgentLoopImpl(
     };
   })();
 
+  const directChatCostPolicy = resolveDirectChatCostPolicy({
+    callSite: turnCallSite,
+    channelName: capturedTurnChannelContext.userMessageChannel,
+    chatType: ctx.channelCapabilities?.chatType,
+    commandIntent: ctx.commandIntent,
+    isSubagent: ctx.isSubagent,
+    overrideProfile: turnOverrideProfile,
+  });
+
   ctx.lastAssistantAttachments = [];
   ctx.lastAttachmentWarnings = [];
 
@@ -736,7 +746,10 @@ export async function runAgentLoopImpl(
     // cancels the response, since the user message is already persisted.
     // Deferred via setTimeout so the main agent loop LLM call enqueues
     // first, avoiding rate-limit slot contention on strict configs.
-    if (isReplaceableTitle(turnStartConversation?.title ?? null)) {
+    if (
+      directChatCostPolicy.generateTitle &&
+      isReplaceableTitle(turnStartConversation?.title ?? null)
+    ) {
       // TurnContext routed through the canonical builder so the pipeline's
       // log record reports the same `conversationId`/`turnIndex` shape as
       // every other slot in this turn. Title generation does not depend on
@@ -774,7 +787,8 @@ export async function runAgentLoopImpl(
     }
 
     const isFirstMessage = ctx.messages.length === 1;
-    let shouldInjectWorkspace = isFirstMessage;
+    let shouldInjectWorkspace =
+      directChatCostPolicy.injectWorkspace && isFirstMessage;
     let compactedThisTurn = false;
 
     const compactCheck = ctx.contextWindowManager.shouldCompact(ctx.messages);
@@ -901,34 +915,42 @@ export async function runAgentLoopImpl(
     // does not need the context-window handle the builder attaches, but
     // keeping every call site on one helper is load-bearing for log
     // coherence across pipeline slots.
-    const memoryPluginTurnCtx = buildPluginTurnContext(ctx, reqId);
-    const memoryArgs: MemoryArgs = {
-      conversationId: ctx.conversationId,
-      trustContext: ctx.trustContext,
-      turnIndex: ctx.turnCount,
-      // Pass the abort signal via `args` (not `deps`) so the pipeline
-      // runner's `linkAbortSignal` can swap it for a signal linked to the
-      // pipeline's internal controller — on a plugin-set timeout or
-      // external cancel, the linked signal aborts and `prepareMemory`
-      // stops mutating graph state / emitting events after the pipeline
-      // has already errored.
-      signal: abortController.signal,
-    };
-    const memoryDeps: DefaultMemoryRetrievalDeps = {
-      messages: ctx.messages,
-      graphMemory: ctx.graphMemory,
-      config: getConfig(),
-      onEvent,
-      isTrustedActor,
-    };
-    const memoryResult: MemoryResult = await runPipeline(
-      "memoryRetrieval",
-      getMiddlewaresFor("memoryRetrieval"),
-      (args) => runDefaultMemoryRetrieval(args, memoryDeps),
-      memoryArgs,
-      memoryPluginTurnCtx,
-      DEFAULT_TIMEOUTS.memoryRetrieval,
-    );
+    const memoryResult: MemoryResult = directChatCostPolicy.runMemoryRetrieval
+      ? await (async () => {
+          const memoryPluginTurnCtx = buildPluginTurnContext(ctx, reqId);
+          const memoryArgs: MemoryArgs = {
+            conversationId: ctx.conversationId,
+            trustContext: ctx.trustContext,
+            turnIndex: ctx.turnCount,
+            // Pass the abort signal via `args` (not `deps`) so the pipeline
+            // runner's `linkAbortSignal` can swap it for a signal linked to the
+            // pipeline's internal controller — on a plugin-set timeout or
+            // external cancel, the linked signal aborts and `prepareMemory`
+            // stops mutating graph state / emitting events after the pipeline
+            // has already errored.
+            signal: abortController.signal,
+          };
+          const memoryDeps: DefaultMemoryRetrievalDeps = {
+            messages: ctx.messages,
+            graphMemory: ctx.graphMemory,
+            config: getConfig(),
+            onEvent,
+            isTrustedActor,
+          };
+          return runPipeline(
+            "memoryRetrieval",
+            getMiddlewaresFor("memoryRetrieval"),
+            (args) => runDefaultMemoryRetrieval(args, memoryDeps),
+            memoryArgs,
+            memoryPluginTurnCtx,
+            DEFAULT_TIMEOUTS.memoryRetrieval,
+          );
+        })()
+      : {
+          pkbContent: null,
+          nowContent: null,
+          memoryGraphBlocks: [],
+        };
 
     // Consume the memory-graph block when the default retriever emitted
     // one. Custom plugins that substitute their own blocks without the
@@ -1257,7 +1279,8 @@ export async function runAgentLoopImpl(
       slackActiveThreadFocusBlock,
     } as const;
 
-    let currentInjectionMode: InjectionMode = "full";
+    let currentInjectionMode: InjectionMode =
+      directChatCostPolicy.initialInjectionMode;
 
     // Canonical per-turn TurnContext forwarded to the injector chain. The
     // per-turn injection inputs are built inside `applyRuntimeInjections`
@@ -2667,7 +2690,11 @@ export async function runAgentLoopImpl(
     // using the last 3 messages for better context. Only fires when the
     // current title was auto-generated (isAutoTitle = 1) and the user
     // has not opted out via `conversations.skipAutoRetitling`.
-    if (ctx.turnCount === 2 && !getConfig().conversations.skipAutoRetitling) {
+    if (
+      directChatCostPolicy.generateTitle &&
+      ctx.turnCount === 2 &&
+      !getConfig().conversations.skipAutoRetitling
+    ) {
       // turnCount is 0-indexed, incremented in finally; 2 = about to become 3rd turn
       queueRegenerateConversationTitle({
         conversationId: ctx.conversationId,
