@@ -1,0 +1,30 @@
+[Unit]
+Description=Vellum AI Assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/vellum-assistant
+Environment="BUN_INSTALL=%h/.bun"
+Environment="PATH=%h/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="HOME=%h"
+Environment="LD_LIBRARY_PATH=%h/playwright-deps/extracted/usr/lib/x86_64-linux-gnu"
+Environment="BASE_DATA_DIR=%h/.local/share/vellum/assistants/vellum"
+EnvironmentFile=%h/.local/share/vellum/assistants/vellum/.vellum/.env
+UMask=0077
+NoNewPrivileges=true
+OOMScoreAdjust=-500
+MemoryMax=1200M
+MemorySwapMax=512M
+CPUQuota=150%
+TasksMax=128
+ExecStart=%h/.bun/bin/vellum wake vellum --foreground
+ExecStop=%h/.bun/bin/vellum sleep vellum
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
