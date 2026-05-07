@@ -9,7 +9,10 @@ metadata:
     user-invocable: true
 ---
 
-This skill provides Gmail-specific operations beyond the shared **messaging** skill. For cross-platform messaging (send, read, search, reply), use the messaging skill. Gmail operations depend on the messaging skill's provider infrastructure - load messaging first if Gmail is not yet connected.
+This skill provides Gmail-specific operations beyond the shared **messaging** skill. For cross-platform messaging (send, read, search, reply), use the messaging skill.
+
+**Prerequisite**: Gmail depends on the messaging skill. Load it first:
+`skill_load("messaging")`
 
 ## Script Reference
 

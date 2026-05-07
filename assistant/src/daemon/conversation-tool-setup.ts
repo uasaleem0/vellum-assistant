@@ -368,6 +368,7 @@ const DEFAULT_PREACTIVATED_SKILL_IDS = [
   "notifications",
   "subagent",
   "time-based-actions",
+  "schedule",
 ];
 
 /**
