@@ -142,7 +142,7 @@ function spawnRunner(
     // environments where the container provides isolation.
     const sandboxConfig = { enabled: false } as const;
 
-    const bunRunCmd = "bun run __skill_runner.ts";
+    const bunRunCmd = `${process.execPath} run __skill_runner.ts`;
     const wrapped = wrapCommand(bunRunCmd, runDir, sandboxConfig);
 
     const env = buildSanitizedEnv();
