@@ -160,7 +160,7 @@ If no style items exist and the user asks you to draft a message, suggest runnin
 
 ## Recipient Context
 
-Before composing or sending a message to someone, look up their contact record with `contact_search` using their name or channel address. If the contact has notes (e.g. relationship context, communication preferences, response expectations), use that context to inform the message's tone, level of detail, and content. This ensures outbound messages are personalized to the recipient — not just the sender's style.
+Before composing or sending a message to someone, look up their contact record with `contact_search` using their name or channel address. **Prerequisite**: `contact_search` is provided by the **contacts** bundled skill — call `skill_load("contacts")` first if it is not already active. If the contact has notes (e.g. relationship context, communication preferences, response expectations), use that context to inform the message's tone, level of detail, and content. This ensures outbound messages are personalized to the recipient — not just the sender's style.
 
 If no contact record exists, proceed without recipient context.
 
