@@ -1,0 +1,149 @@
+{
+  "skill": "meet-join",
+  "tools": [
+    {
+      "name": "meet_cancel_speak",
+      "description": "Cancel any in-flight synthesized speech in an active Google Meet call so the assistant can voluntarily stop talking (e.g. when interrupted by a participant). When exactly one Meet session is active, meetingId may be omitted and the active session is targeted automatically; otherwise pass the specific meetingId returned by meet_join.",
+      "category": "meet",
+      "risk": "low",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "meetingId": {
+            "type": "string",
+            "description": "The id of the meeting whose in-flight speech should be cancelled. Optional when exactly one session is active."
+          }
+        }
+      }
+    },
+    {
+      "name": "meet_disable_avatar",
+      "description": "Turn off the assistant's video avatar in an active Google Meet call. See the Video avatar section of the meet-join SKILL.md for when to use this (notably: disable during long stretches of silence so participants don't read the avatar as watching). When exactly one Meet session is active, meetingId may be omitted and the active session is targeted automatically; otherwise pass the specific meetingId returned by meet_join.",
+      "category": "meet",
+      "risk": "low",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "meetingId": {
+            "type": "string",
+            "description": "The id of the meeting to disable the avatar in, as returned by meet_join. Optional when exactly one session is active."
+          }
+        }
+      }
+    },
+    {
+      "name": "meet_enable_avatar",
+      "description": "Turn on the assistant's video avatar in an active Google Meet call. The avatar lip-syncs to meet_speak output; it is off by default on join and must be explicitly enabled. See the Video avatar section of the meet-join SKILL.md for when to use this. When exactly one Meet session is active, meetingId may be omitted and the active session is targeted automatically; otherwise pass the specific meetingId returned by meet_join.",
+      "category": "meet",
+      "risk": "low",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "meetingId": {
+            "type": "string",
+            "description": "The id of the meeting to enable the avatar in, as returned by meet_join. Optional when exactly one session is active."
+          }
+        }
+      }
+    },
+    {
+      "name": "meet_join",
+      "description": "Join a Google Meet call as an AI note-taker. The bot announces itself in the meeting chat, captures a live transcript, and can be asked to leave at any time. Only call this when the user explicitly asks the assistant to join a specific Meet URL.",
+      "category": "meet",
+      "risk": "high",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The Google Meet URL to join, e.g. https://meet.google.com/xxx-yyyy-zzz."
+          },
+          "note": {
+            "type": "string",
+            "description": "Optional free-form note about why the assistant is joining (recorded alongside the session for later reference)."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    },
+    {
+      "name": "meet_leave",
+      "description": "Leave an active Google Meet call that the assistant previously joined. When exactly one Meet session is active, meetingId may be omitted and the active session is targeted automatically; otherwise pass the specific meetingId returned by meet_join.",
+      "category": "meet",
+      "risk": "low",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "meetingId": {
+            "type": "string",
+            "description": "The id of the meeting to leave, as returned by meet_join. Optional when exactly one session is active."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Free-form reason recorded with the leave event (e.g. 'user-requested', 'task-complete'). Defaults to 'requested'."
+          }
+        }
+      }
+    },
+    {
+      "name": "meet_send_chat",
+      "description": "Post a message into the chat of an active Google Meet call. When exactly one Meet session is active, meetingId may be omitted and the active session is targeted automatically; otherwise pass the specific meetingId returned by meet_join.",
+      "category": "meet",
+      "risk": "low",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "meetingId": {
+            "type": "string",
+            "description": "The id of the meeting to send chat to, as returned by meet_join. Optional when exactly one session is active."
+          },
+          "text": {
+            "type": "string",
+            "description": "The message text to post into the meeting chat. Keep it concise and conversational."
+          }
+        },
+        "required": [
+          "text"
+        ]
+      }
+    },
+    {
+      "name": "meet_speak",
+      "description": "Speak synthesized audio into an active Google Meet call. Use this to reply out loud during a meeting; for long-form answers prefer meet_send_chat. When exactly one Meet session is active, meetingId may be omitted and the active session is targeted automatically; otherwise pass the specific meetingId returned by meet_join.",
+      "category": "meet",
+      "risk": "low",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "meetingId": {
+            "type": "string",
+            "description": "The id of the meeting to speak into, as returned by meet_join. Optional when exactly one session is active."
+          },
+          "text": {
+            "type": "string",
+            "description": "The text to synthesize and play. Keep it conversational and under 600 characters — longer replies should be sent via meet_send_chat."
+          },
+          "voice": {
+            "type": "string",
+            "description": "Optional provider-specific voice identifier. Falls back to the configured default voice when omitted."
+          }
+        },
+        "required": [
+          "text"
+        ]
+      }
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "^\\/v1\\/internal\\/meet\\/([^/]+)\\/events$",
+      "methods": [
+        "POST"
+      ]
+    }
+  ],
+  "shutdownHooks": [],
+  "sourceHash": "5a4573ec4d110ac17e120815efcf8e8148d45fa2a846531804d599f9154b4bb2"
+}

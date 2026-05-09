@@ -369,6 +369,13 @@ const DEFAULT_PREACTIVATED_SKILL_IDS = [
   "subagent",
   "time-based-actions",
   "schedule",
+  // Core executive assistant skills — always active for Val
+  "gmail",
+  "google-calendar",
+  "google-drive",
+  "google-drive-write",
+  "wisdomos-operator",
+  "website-analyst",
 ];
 
 /**
