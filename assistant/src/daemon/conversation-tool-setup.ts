@@ -376,6 +376,8 @@ const DEFAULT_PREACTIVATED_SKILL_IDS = [
   "google-drive-write",
   "wisdomos-operator",
   "website-analyst",
+  "google-analytics",
+  "posthog",
 ];
 
 /**
