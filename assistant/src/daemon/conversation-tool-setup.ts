@@ -378,6 +378,7 @@ const DEFAULT_PREACTIVATED_SKILL_IDS = [
   "website-analyst",
   "google-analytics",
   "posthog",
+  "supabase-analytics",
 ];
 
 /**
