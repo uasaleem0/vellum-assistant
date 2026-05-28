@@ -1476,6 +1476,26 @@ async function main() {
         return undefined as unknown as Response;
       }
 
+      // ── Val Bridge proxy — /bridge/* → localhost:3001 ──
+      if (url.pathname.startsWith("/bridge/")) {
+        try {
+          const bridgeUrl = `http://localhost:3001${url.pathname}${url.search}`;
+          const bridgeReq = new Request(bridgeUrl, {
+            method: req.method,
+            headers: req.headers,
+            body:
+              req.method !== "GET" && req.method !== "HEAD"
+                ? req.body
+                : undefined,
+          });
+          return await fetch(bridgeReq);
+        } catch {
+          return Response.json(
+            { error: "Bridge service unavailable" },
+            { status: 503 },
+          );
+        }
+      }
       // Attach a trace ID to every non-healthcheck request for
       // end-to-end correlation across webhook -> runtime -> reply.
       if (!req.headers.has("x-trace-id")) {
