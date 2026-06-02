@@ -379,6 +379,7 @@ const DEFAULT_PREACTIVATED_SKILL_IDS = [
   "google-analytics",
   "posthog",
   "website-analytics",
+  "browser",
 ];
 
 /**

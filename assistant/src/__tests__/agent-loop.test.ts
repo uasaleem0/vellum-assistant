@@ -1894,7 +1894,7 @@ describe("AgentLoop", () => {
     expect(lastAssistant!.content).toEqual([]);
   });
 
-  test("does not retry empty response on first turn (no prior tool use)", async () => {
+  test("retries empty response on a user turn even without prior tool use", async () => {
     const emptyResponse: ProviderResponse = {
       content: [],
       model: "mock-model",
@@ -1902,15 +1902,37 @@ describe("AgentLoop", () => {
       stopReason: "end_turn",
     };
 
-    const { provider, calls } = createMockProvider([emptyResponse]);
+    const { provider, calls } = createMockProvider([
+      emptyResponse,
+      textResponse("Sorry, I did not produce a response the first time."),
+    ]);
 
     const loop = new AgentLoop(provider, "system");
     const events: AgentEvent[] = [];
     const history = await loop.run([userMessage], collectEvents(events));
 
-    // Should NOT retry — this is the first turn with no tool use history
-    expect(calls).toHaveLength(1);
-    expect(history).toHaveLength(2); // user + empty assistant
+    expect(calls).toHaveLength(2);
+    const retryMessages = calls[1].messages;
+    const lastMsg = retryMessages[retryMessages.length - 1];
+    expect(lastMsg.role).toBe("user");
+    expect(
+      lastMsg.content.some(
+        (b) =>
+          b.type === "text" &&
+          "text" in b &&
+          (b as { text: string }).text.includes("previous response was empty"),
+      ),
+    ).toBe(true);
+
+    const lastAssistant = [...history]
+      .reverse()
+      .find((m) => m.role === "assistant");
+    expect(lastAssistant?.content).toEqual([
+      {
+        type: "text",
+        text: "Sorry, I did not produce a response the first time.",
+      },
+    ]);
   });
 
   // PR 6: callSite threading from AgentLoop.run() into provider config.

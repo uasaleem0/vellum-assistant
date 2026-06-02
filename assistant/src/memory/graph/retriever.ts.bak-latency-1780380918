@@ -763,7 +763,7 @@ export async function loadContextMemory(
 
   // 7. LLM re-ranking on the main pool: dedup + select
   const reranked = await rerankAndDedup(
-    mainPool.slice(0, 24), // latency: shrink LLM rerank input (top-ranked candidates)
+    mainPool.slice(0, 100),
     mainSlots,
     opts.config,
   );
@@ -1247,7 +1247,7 @@ export async function retrieveForTurn(
   scored.sort((a, b) => b.score - a.score);
   const INJECTION_THRESHOLD = 0.3;
   // Hard cap on candidates fed to the dedup LLM — effectively caps maxNodes
-  const PRE_DEDUP_POOL = 10; // latency: smaller per-turn rerank pool
+  const PRE_DEDUP_POOL = 20;
   const maxGeneralNodes = Math.max(
     0,
     perTurnCfg.maxNodes -

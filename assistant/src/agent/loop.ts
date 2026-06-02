@@ -669,9 +669,9 @@ export class AgentLoop {
         );
 
         // Detect empty responses: no user-visible text and no tool calls.
-        // This can happen when the model fails to produce output after
-        // receiving a large tool result. Retry once with a nudge before
-        // the message is persisted.
+        // This can happen when the model fails to produce output for a user
+        // turn or after receiving a large tool result. Retry once with a
+        // nudge before the message is persisted.
         //
         // Only nudge when the model hasn't already delivered text to the user
         // earlier in this tool-use chain. If a prior assistant turn in history
@@ -751,7 +751,7 @@ export class AgentLoop {
           emptyResponseRetries++;
           rlog.warn(
             { turn: toolUseTurns, retry: emptyResponseRetries },
-            "Model returned empty response after tool results — retrying",
+            "Model returned empty response — retrying",
           );
           history.push({
             role: "user",
@@ -782,7 +782,7 @@ export class AgentLoop {
         ) {
           rlog.error(
             { turn: toolUseTurns, retries: emptyResponseRetries },
-            "Model returned empty response after tool results — retries exhausted",
+            "Model returned empty response — retries exhausted",
           );
         }
 
