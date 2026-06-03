@@ -377,7 +377,6 @@ const DEFAULT_PREACTIVATED_SKILL_IDS = [
   "wisdomos-operator",
   "website-analytics",
   "self-health",
-  "val-app",
   "browser",
 ];
 
