@@ -27,7 +27,7 @@ First-party skills are **bundled** with the assistant - they are compiled in and
 skill_load skill=<skill-id>
 ```
 
-Your auto-injected Skills Catalog (pkb/skills-catalog.md, included in every conversation) lists every skill with its ID and description, split into always-on skills and load-on-demand skills. When a user asks what you can do, refer to that catalog. To use a load-on-demand skill, call skill_load with its ID first, then call its tools.
+The skill catalog shown in the system prompt lists all bundled skills with their IDs. When a user asks about capabilities, refer to this list to find relevant bundled skills and load them as needed.
 
 ## Community skills (skills.sh)
 
