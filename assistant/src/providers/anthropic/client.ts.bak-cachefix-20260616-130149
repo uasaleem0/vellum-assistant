@@ -698,7 +698,7 @@ export class AnthropicProvider implements Provider {
     const cacheTtl: "5m" | "1h" =
       ((config as Record<string, unknown> | undefined)?.cacheTtl as
         | "5m"
-        | "1h") ?? "5m"; // cachefix: was "1h" (2x write); unintended default — main brain never passes cacheTtl
+        | "1h") ?? "1h";
     let sentMessages: Anthropic.MessageParam[] | undefined;
     const startedAt = Date.now();
     // Hoisted so the catch block can distinguish our inner stream timeout

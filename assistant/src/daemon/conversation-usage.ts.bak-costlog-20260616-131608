@@ -201,12 +201,6 @@ export function recordUsage(
         inputTokens: directInputTokens,
         outputTokens,
         cacheCreationInputTokens: normalizedCacheCreationInputTokens,
-        cacheCreation5mTokens:
-          pricingUsage.anthropicCacheCreation?.ephemeral_5m_input_tokens ??
-          null,
-        cacheCreation1hTokens:
-          pricingUsage.anthropicCacheCreation?.ephemeral_1h_input_tokens ??
-          null,
         cacheReadInputTokens: normalizedCacheReadInputTokens,
         conversationId: ctx.conversationId,
         runId: null,
