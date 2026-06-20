@@ -125,6 +125,10 @@
             "type": "number",
             "description": "Maximum number of results to return (default 20)"
           },
+          "count_only": {
+            "type": "boolean",
+            "description": "If true, return only the exact total count of matching messages (no message content). Use this for \"how many\" questions \u2014 it is exact and avoids returning message bodies."
+          },
           "activity": {
             "type": "string",
             "description": "Brief non-technical explanation of why this tool is being called"
