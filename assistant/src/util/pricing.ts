@@ -150,7 +150,7 @@ export function usesAnthropicPricingRules(
   model: string,
 ): boolean {
   if (provider === "anthropic") return true;
-  if (provider === "openrouter" && isAnthropicModelId(model)) return true;
+  if (isAnthropicModelId(model)) return true;
   return false;
 }
 
@@ -388,7 +388,7 @@ export function resolvePricingForUsage(
   // catalog using the normalized bare slug. OpenRouter bills these calls at
   // Anthropic's rates and the underlying Messages API response includes
   // Anthropic's cache- and speed-metadata fields.
-  if (provider === "openrouter" && isAnthropicModelId(model)) {
+  if (isAnthropicModelId(model)) {
     const pricing = findPricing("anthropic", normalizeAnthropicModelId(model));
     if (pricing) {
       return {

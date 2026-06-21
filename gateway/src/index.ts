@@ -1739,6 +1739,25 @@ async function main() {
 
     // ── Pre-router: health/readiness probes ──
     // These bypass rate limiting and tracing for minimal overhead.
+    // ── Val Bridge proxy — /bridge/* → localhost:3001 ──
+    if (url.pathname.startsWith("/bridge/")) {
+      try {
+        const bridgeUrl = `http://localhost:3001${url.pathname}${url.search}`;
+        const bridgeReq = new Request(bridgeUrl, {
+          method: req.method,
+          headers: req.headers,
+          body:
+            req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
+        });
+        return await fetch(bridgeReq);
+      } catch {
+        return Response.json(
+          { error: "Bridge service unavailable" },
+          { status: 503 },
+        );
+      }
+    }
+
     if (url.pathname === "/healthz") {
       const includeMigrations =
         url.searchParams.get("include") === "migrations";

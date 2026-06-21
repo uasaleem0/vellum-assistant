@@ -793,7 +793,7 @@ export class AnthropicProvider implements Provider {
     const cacheTtl: "5m" | "1h" =
       ((config as Record<string, unknown> | undefined)?.cacheTtl as
         | "5m"
-        | "1h") ?? "1h";
+        | "1h") ?? "5m";
     // Opt-out for callers (e.g. the memory router) that send a single
     // user message per call with content that changes every time. The
     // turn-start cache breakpoint below is only useful when the same

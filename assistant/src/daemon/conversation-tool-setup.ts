@@ -392,7 +392,23 @@ export function createProxyApprovalCallback(
  * history or explicit preactivation. Without this, their tools are
  * unavailable in fresh conversations until `skill_load` is called.
  */
-const DEFAULT_PREACTIVATED_SKILL_IDS = ["notifications", "subagent"];
+const DEFAULT_PREACTIVATED_SKILL_IDS = [
+  "tasks",
+  "notifications",
+  "subagent",
+  "time-based-actions",
+  "schedule",
+  // Core executive assistant skills — always active for Val
+  "gmail",
+  "google-calendar",
+  "google-drive",
+  "google-drive-write",
+  "wisdomos-operator",
+  "website-analytics",
+  "self-health",
+  "val-app",
+  "browser",
+];
 
 /**
  * Subset of Conversation state that the resolveTools callback reads at each
