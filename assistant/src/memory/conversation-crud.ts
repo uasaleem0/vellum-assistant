@@ -226,10 +226,7 @@ export interface MessageRow {
   metadata: string | null;
 }
 
-const parseMessage = createRowMapper<
-  typeof messages.$inferSelect,
-  MessageRow
->({
+const parseMessage = createRowMapper<typeof messages.$inferSelect, MessageRow>({
   id: "id",
   conversationId: "conversationId",
   role: "role",

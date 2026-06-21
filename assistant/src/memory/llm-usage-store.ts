@@ -218,7 +218,6 @@ interface TotalsRow {
   unpriced_event_count: number;
 }
 
-
 interface GroupRow {
   group_key: string;
   group_id: string | null;

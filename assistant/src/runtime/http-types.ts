@@ -19,7 +19,6 @@ import type {
   GuardianActionCopyGenerator,
 } from "./message-composer-types.js";
 
-
 export type {
   ApprovalCopyGenerator,
   ApprovalMessageContext,

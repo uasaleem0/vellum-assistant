@@ -167,7 +167,8 @@ function loadAllowedExtensionOrigins(): ReadonlySet<string> {
     for (const id of readIdsFromFile(localOverridePath, {
       allowEmpty: true,
     })) {
-      merged.add(`chrome-extension://${id}/`); merged.add(`chrome-extension://${id}`);
+      merged.add(`chrome-extension://${id}/`);
+      merged.add(`chrome-extension://${id}`);
     }
   } catch (err) {
     const isMissing =
@@ -184,7 +185,8 @@ function loadAllowedExtensionOrigins(): ReadonlySet<string> {
   //    so file-based config paths can disappear in packaged builds;
   //    `VELLUM_CHROME_EXTENSION_IDS` is set at compile time for that case.
   for (const id of loadAllowedExtensionIdsFromEnv()) {
-    merged.add(`chrome-extension://${id}/`); merged.add(`chrome-extension://${id}`);
+    merged.add(`chrome-extension://${id}/`);
+    merged.add(`chrome-extension://${id}`);
   }
 
   if (merged.size === 0) {

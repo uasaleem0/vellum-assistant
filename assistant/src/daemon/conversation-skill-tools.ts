@@ -225,7 +225,8 @@ export function projectSkillTools(
   // Daily-driver skills configured under skills.defaultPreactivated are
   // unioned with per-conversation preactivated IDs so their tools are always
   // registered at conversation start, with no explicit skill_load required.
-  const configDefaultPreactivated = getConfig().skills.defaultPreactivated ?? [];
+  const configDefaultPreactivated =
+    getConfig().skills.defaultPreactivated ?? [];
   const preactivated = [
     ...(options?.preactivatedSkillIds ?? []),
     ...configDefaultPreactivated,

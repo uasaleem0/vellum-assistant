@@ -343,10 +343,21 @@ export const ROUTES: RouteDefinition[] = [
     tags: ["schedules"],
     requestBody: z.object({
       name: z.string().describe("Short label for the schedule"),
-      message: z.string().describe("What Val should say/do when the schedule fires"),
-      nextRunAtMs: z.number().optional().describe("Unix timestamp in ms for one-shot reminders"),
-      cronExpression: z.string().optional().describe("Cron expression for recurring schedules (5 fields)"),
-      timezone: z.string().optional().describe("IANA timezone, e.g. Europe/London"),
+      message: z
+        .string()
+        .describe("What Val should say/do when the schedule fires"),
+      nextRunAtMs: z
+        .number()
+        .optional()
+        .describe("Unix timestamp in ms for one-shot reminders"),
+      cronExpression: z
+        .string()
+        .optional()
+        .describe("Cron expression for recurring schedules (5 fields)"),
+      timezone: z
+        .string()
+        .optional()
+        .describe("IANA timezone, e.g. Europe/London"),
     }),
     responseBody: z.object({
       id: z.string(),
@@ -355,7 +366,8 @@ export const ROUTES: RouteDefinition[] = [
       isOneShot: z.boolean(),
       nextRunAt: z.number(),
     }),
-    handler: ({ body }: RouteHandlerArgs) => handleCreateSchedule(body as Record<string, unknown>),
+    handler: ({ body }: RouteHandlerArgs) =>
+      handleCreateSchedule(body as Record<string, unknown>),
   },
 ];
 
@@ -531,19 +543,25 @@ async function handleRunScheduleNow(id: string) {
 function handleCreateSchedule(body: Record<string, unknown>) {
   const name = typeof body.name === "string" ? body.name.trim() : "";
   const message = typeof body.message === "string" ? body.message.trim() : "";
-  const nextRunAtMs = typeof body.nextRunAtMs === "number" ? body.nextRunAtMs : null;
-  const cronExpression = typeof body.cronExpression === "string" ? body.cronExpression.trim() : null;
-  const timezone = typeof body.timezone === "string" ? body.timezone.trim() : null;
+  const nextRunAtMs =
+    typeof body.nextRunAtMs === "number" ? body.nextRunAtMs : null;
+  const cronExpression =
+    typeof body.cronExpression === "string" ? body.cronExpression.trim() : null;
+  const timezone =
+    typeof body.timezone === "string" ? body.timezone.trim() : null;
 
   if (!name) throw new BadRequestError("name is required");
   if (!message) throw new BadRequestError("message is required");
-  if (!nextRunAtMs && !cronExpression) throw new BadRequestError("nextRunAtMs or cronExpression is required");
+  if (!nextRunAtMs && !cronExpression)
+    throw new BadRequestError("nextRunAtMs or cronExpression is required");
 
   const job = createSchedule({
     name,
     message,
     mode: "notify",
-    ...(nextRunAtMs ? { nextRunAt: nextRunAtMs } : { cronExpression, timezone }),
+    ...(nextRunAtMs
+      ? { nextRunAt: nextRunAtMs }
+      : { cronExpression, timezone }),
   });
 
   return {
