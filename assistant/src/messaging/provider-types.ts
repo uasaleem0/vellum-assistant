@@ -71,6 +71,7 @@ export interface HistoryOptions {
 export interface SearchOptions {
   count?: number;
   cursor?: string;
+  countOnly?: boolean;
 }
 
 export interface SendOptions {

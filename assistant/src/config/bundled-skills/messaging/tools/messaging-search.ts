@@ -25,6 +25,7 @@ export async function run(
   const platform = input.platform as string | undefined;
   const query = input.query as string;
   const maxResults = input.max_results as number | undefined;
+  const countOnly = input.count_only === true;
 
   if (!query) {
     return err("query is required.");
@@ -34,7 +35,15 @@ export async function run(
     const provider = await resolveProvider(platform);
     const account = input.account as string | undefined;
     const conn = await getProviderConnection(provider, account);
-    const result = await provider.search(conn, query, { count: maxResults });
+    const result = await provider.search(conn, query, {
+      count: maxResults,
+      countOnly,
+    });
+    if (countOnly) {
+      return ok(
+        JSON.stringify({ total: result.total, count_only: true }, null, 2),
+      );
+    }
     return ok(
       JSON.stringify(
         { ...result, messages: result.messages.map(wrapMessageContent) },

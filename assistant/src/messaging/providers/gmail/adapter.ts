@@ -24,6 +24,26 @@ import type {
 import * as gmail from "./client.js";
 import type { GmailMessage, GmailMessagePart } from "./types.js";
 
+/**
+ * Gmail's resultSizeEstimate is unreliable for larger result sets. When a
+ * result spans multiple pages, count the EXACT number of matches by paging
+ * through message IDs (IDs only — cheap, 500/page) up to a safety cap.
+ */
+async function countExact(
+  conn: OAuthConnection,
+  query: string,
+  cap = 5000,
+): Promise<number> {
+  let total = 0;
+  let pageToken: string | undefined;
+  do {
+    const page = await gmail.listMessages(conn, query, 500, pageToken);
+    total += page.messages?.length ?? 0;
+    pageToken = page.nextPageToken;
+  } while (pageToken && total < cap);
+  return total;
+}
+
 function requireConnection(
   connection: OAuthConnection | undefined,
 ): OAuthConnection {
@@ -202,8 +222,18 @@ export const gmailMessagingProvider: MessagingProvider = {
     const count = options?.count ?? 20;
     const listResult = await gmail.listMessages(conn, query, count);
 
+    // Exact total: a single page means the page length IS the count; otherwise
+    // page through IDs (resultSizeEstimate is unreliable for larger sets).
+    const total = !listResult.nextPageToken
+      ? (listResult.messages?.length ?? 0)
+      : await countExact(conn, query);
+
+    if (options?.countOnly) {
+      return { total, messages: [], hasMore: !!listResult.nextPageToken };
+    }
+
     if (!listResult.messages?.length) {
-      return { total: 0, messages: [], hasMore: false };
+      return { total, messages: [], hasMore: false };
     }
 
     const messages = await gmail.batchGetMessages(
@@ -213,7 +243,7 @@ export const gmailMessagingProvider: MessagingProvider = {
     );
 
     return {
-      total: listResult.resultSizeEstimate ?? messages.length,
+      total,
       messages: messages.map(mapGmailMessage),
       hasMore: !!listResult.nextPageToken,
       nextCursor: listResult.nextPageToken,

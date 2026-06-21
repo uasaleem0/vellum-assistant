@@ -112,6 +112,7 @@ When a messaging tool fails with a token or authorization error:
 - **List Conversations**: Show inboxes, DMs with unread counts
 - **Read Messages**: Read message history from a conversation
 - **Search**: Search messages with platform-appropriate query syntax
+- **Count**: For "how many" questions (unread, important, spam, etc.), call `messaging_search` with `count_only: true` and a bare label query (`is:unread`, `in:spam`, `is:important`). Returns the EXACT total with no message content. Never run a full content search just to count, never use messaging_list_conversations to count unread (it is unreliable), and never estimate.
 - **Send / Reply**: Send a message or reply in a thread (via `thread_id`). High risk - requires user approval.
 - **Mark Read**: Mark conversation as read
 
