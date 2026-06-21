@@ -13,6 +13,7 @@ import { getConversation } from "../../memory/conversation-crud.js";
 import { runScript } from "../../schedule/run-script.js";
 import {
   cancelSchedule,
+  createSchedule,
   completeScheduleRun,
   createScheduleRun,
   deleteSchedule,
@@ -332,6 +333,42 @@ export const ROUTES: RouteDefinition[] = [
     handler: ({ pathParams }: RouteHandlerArgs) =>
       handleRunScheduleNow(pathParams!.id),
   },
+  {
+    operationId: "createSchedule",
+    endpoint: "schedules",
+    method: "POST",
+    policyKey: "schedules",
+    summary: "Create schedule",
+    description: "Create a new one-shot reminder or recurring schedule.",
+    tags: ["schedules"],
+    requestBody: z.object({
+      name: z.string().describe("Short label for the schedule"),
+      message: z
+        .string()
+        .describe("What Val should say/do when the schedule fires"),
+      nextRunAtMs: z
+        .number()
+        .optional()
+        .describe("Unix timestamp in ms for one-shot reminders"),
+      cronExpression: z
+        .string()
+        .optional()
+        .describe("Cron expression for recurring schedules (5 fields)"),
+      timezone: z
+        .string()
+        .optional()
+        .describe("IANA timezone, e.g. Europe/London"),
+    }),
+    responseBody: z.object({
+      id: z.string(),
+      name: z.string(),
+      enabled: z.boolean(),
+      isOneShot: z.boolean(),
+      nextRunAt: z.number(),
+    }),
+    handler: ({ body }: RouteHandlerArgs) =>
+      handleCreateSchedule(body as Record<string, unknown>),
+  },
 ];
 
 async function handleRunScheduleNow(id: string) {
@@ -501,4 +538,37 @@ async function handleRunScheduleNow(id: string) {
     completeScheduleRun(runId, { status: "error", error: message });
   }
   return handleListSchedules({});
+}
+
+function handleCreateSchedule(body: Record<string, unknown>) {
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  const message = typeof body.message === "string" ? body.message.trim() : "";
+  const nextRunAtMs =
+    typeof body.nextRunAtMs === "number" ? body.nextRunAtMs : null;
+  const cronExpression =
+    typeof body.cronExpression === "string" ? body.cronExpression.trim() : null;
+  const timezone =
+    typeof body.timezone === "string" ? body.timezone.trim() : null;
+
+  if (!name) throw new BadRequestError("name is required");
+  if (!message) throw new BadRequestError("message is required");
+  if (!nextRunAtMs && !cronExpression)
+    throw new BadRequestError("nextRunAtMs or cronExpression is required");
+
+  const job = createSchedule({
+    name,
+    message,
+    mode: "notify",
+    ...(nextRunAtMs
+      ? { nextRunAt: nextRunAtMs }
+      : { cronExpression, timezone }),
+  });
+
+  return {
+    id: job.id,
+    name: job.name,
+    enabled: job.enabled,
+    isOneShot: job.cronExpression == null,
+    nextRunAt: job.nextRunAt,
+  };
 }

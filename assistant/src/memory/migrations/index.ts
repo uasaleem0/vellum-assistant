@@ -181,6 +181,7 @@ export {
   downActivationState,
   migrateActivationState,
 } from "./232-activation-state.js";
+export { migrateUsageCacheCreationTtlSplit } from "./233-usage-cache-creation-ttl-split.js";
 export {
   MIGRATION_REGISTRY,
   type MigrationRegistryEntry,

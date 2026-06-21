@@ -19,7 +19,6 @@ import type {
   GuardianActionCopyGenerator,
 } from "./message-composer-types.js";
 
-
 export type {
   ApprovalCopyGenerator,
   ApprovalMessageContext,
@@ -203,6 +202,7 @@ export interface RuntimeMessagePayload {
   role: string;
   content: string;
   timestamp: string;
+  model?: string;
   attachments: RuntimeAttachmentMetadata[];
   toolCalls?: Array<{
     name: string;

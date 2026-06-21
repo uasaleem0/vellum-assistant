@@ -239,6 +239,7 @@ describe("resolveSkillStates with feature flags", () => {
         load: { extraDirs: [], watch: true, watchDebounceMs: 250 },
         install: { nodeManager: "npm" },
         allowBundled: null,
+        defaultPreactivated: [],
         remoteProviders: {
           skillssh: { enabled: true },
           clawhub: { enabled: true },

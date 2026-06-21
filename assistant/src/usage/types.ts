@@ -33,6 +33,14 @@ export interface UsageEventInput {
   inputTokens: number;
   outputTokens: number;
   cacheCreationInputTokens: number | null;
+  /**
+   * Anthropic prompt-cache write breakdown by TTL tier, when available.
+   * 5-minute writes bill at 1.25x base, 1-hour writes at 2x base. Null when
+   * the provider response carried no breakdown (the pricing layer then treats
+   * cacheCreationInputTokens as 100% 5m). Persisted for correctness/auditing.
+   */
+  cacheCreation5mTokens?: number | null;
+  cacheCreation1hTokens?: number | null;
   cacheReadInputTokens: number | null;
   actor: UsageActor;
   conversationId: string | null;

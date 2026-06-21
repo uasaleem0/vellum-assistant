@@ -137,6 +137,12 @@ export const SkillsConfigSchema = z
       .describe(
         "Allowlist of bundled skill names to load (null = load all bundled skills)",
       ),
+    defaultPreactivated: z
+      .array(z.string())
+      .default([])
+      .describe(
+        "Skill IDs preactivated (tools registered) at the start of every conversation, before the first message — makes daily-driver skills always available without an explicit skill_load.",
+      ),
     remoteProviders: RemoteProvidersConfigSchema.default(
       RemoteProvidersConfigSchema.parse({}),
     ),

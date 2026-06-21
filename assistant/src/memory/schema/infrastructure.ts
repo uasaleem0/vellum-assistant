@@ -175,6 +175,8 @@ export const llmUsageEvents = sqliteTable(
     inputTokens: integer("input_tokens").notNull(),
     outputTokens: integer("output_tokens").notNull(),
     cacheCreationInputTokens: integer("cache_creation_input_tokens"),
+    cacheCreation5mTokens: integer("cache_creation_5m_tokens"),
+    cacheCreation1hTokens: integer("cache_creation_1h_tokens"),
     cacheReadInputTokens: integer("cache_read_input_tokens"),
     estimatedCostUsd: real("estimated_cost_usd"),
     pricingStatus: text("pricing_status").notNull(),

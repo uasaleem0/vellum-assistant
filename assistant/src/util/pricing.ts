@@ -175,13 +175,21 @@ function normalizeAnthropicModelId(model: string): string {
  * calls and for Anthropic models routed through OpenRouter — OpenRouter
  * proxies to Anthropic's Messages API, so the usage response carries the
  * same cache and speed fields and is charged at Anthropic's rates.
+ *
+ * Also true whenever the MODEL id is an Anthropic model (`claude-*` /
+ * `anthropic/*`), regardless of the `provider` label. Val's brain routes
+ * Claude through a gateway provider labelled `provider="gemini"`, so DB rows
+ * read `provider=gemini, model=claude-sonnet-4-6`; the underlying call is
+ * still Anthropic's Messages API and must be priced under Anthropic rules.
+ * Without this, every Claude row falls through to the (non-existent) gemini
+ * `claude-*` catalog entry and is recorded as `unpriced` with a NULL cost.
  */
 export function usesAnthropicPricingRules(
   provider: string,
   model: string,
 ): boolean {
   if (provider === "anthropic") return true;
-  if (provider === "openrouter" && isAnthropicModelId(model)) return true;
+  if (isAnthropicModelId(model)) return true;
   return false;
 }
 
@@ -400,11 +408,15 @@ export function resolvePricingForUsage(
   model: string,
   usage: PricingUsage,
 ): PricingResult {
-  // Anthropic models routed through OpenRouter: look up against the Anthropic
-  // catalog using the normalized bare slug. OpenRouter bills these calls at
-  // Anthropic's rates and the underlying Messages API response includes
-  // Anthropic's cache- and speed-metadata fields.
-  if (provider === "openrouter" && isAnthropicModelId(model)) {
+  // Anthropic models, regardless of the provider label: look up against the
+  // Anthropic catalog using the normalized bare slug. This covers direct
+  // Anthropic calls, Anthropic-on-OpenRouter (billed at Anthropic's rates),
+  // AND Val's gateway which labels Claude rows `provider="gemini"` while
+  // actually proxying to Anthropic's Messages API (so the usage response
+  // carries Anthropic's cache- and speed-metadata fields). Matching on the
+  // model id rather than the provider label is what restores real Claude
+  // pricing — without it these rows record as `unpriced` / NULL cost.
+  if (isAnthropicModelId(model)) {
     const anthropicCatalog = PROVIDER_PRICING.anthropic;
     if (anthropicCatalog) {
       const pricing = findPricing(

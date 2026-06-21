@@ -222,7 +222,15 @@ export function projectSkillTools(
   options?: ProjectSkillToolsOptions,
 ): SkillToolProjection {
   const contextEntries = getCachedActiveSkills(history, options?.cache);
-  const preactivated = options?.preactivatedSkillIds ?? [];
+  // Daily-driver skills configured under skills.defaultPreactivated are
+  // unioned with per-conversation preactivated IDs so their tools are always
+  // registered at conversation start, with no explicit skill_load required.
+  const configDefaultPreactivated =
+    getConfig().skills.defaultPreactivated ?? [];
+  const preactivated = [
+    ...(options?.preactivatedSkillIds ?? []),
+    ...configDefaultPreactivated,
+  ];
   const prevActive =
     options?.previouslyActiveSkillIds ?? new Map<string, string>();
 

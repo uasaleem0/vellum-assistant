@@ -80,6 +80,7 @@ import {
   getLastAssistantTimestampBefore,
   getMessages,
   getMessagesPaginated,
+  getMainAgentUsageModels,
   hasMessages,
   type MessageRow,
   provenanceFromTrustContext,
@@ -588,7 +589,30 @@ export function handleListMessages(
       rawMessages[0].createdAt,
     );
   }
+  // Subtle per-message model badge: match each assistant turn to the model
+  // recorded for its main_agent LLM call(s). Best-effort -- never blocks load.
+  let __usageModels: Array<{ at: number; model: string }> = [];
+  try {
+    __usageModels = getMainAgentUsageModels(resolvedConversationId!);
+  } catch {
+    __usageModels = [];
+  }
+  const modelAt = (ts: number): string | undefined => {
+    // Usage is logged within ~ms of its message (sometimes just after), so
+    // pair each message with the nearest main_agent usage inside a window.
+    let best: string | undefined;
+    let bestDt = 60_000;
+    for (const u of __usageModels) {
+      const dt = Math.abs(u.at - ts);
+      if (dt < bestDt) {
+        bestDt = dt;
+        best = u.model;
+      }
+    }
+    return best;
+  };
   const messages: RuntimeMessagePayload[] = parsed.map((m) => {
+    const __model = m.role === "assistant" ? modelAt(m.timestamp) : undefined;
     let msgAttachments: RuntimeAttachmentMetadata[] = [];
     if (m.id) {
       // Use metadata-only query first to avoid loading large base64
@@ -661,6 +685,7 @@ export function handleListMessages(
       role: m.role,
       content: m.text,
       timestamp: new Date(displayTimestamp).toISOString(),
+      ...(__model ? { model: __model } : {}),
       attachments: msgAttachments,
       ...(m.toolCalls.length > 0 ? { toolCalls: m.toolCalls } : {}),
       ...(interfaces ? { interfaces } : {}),

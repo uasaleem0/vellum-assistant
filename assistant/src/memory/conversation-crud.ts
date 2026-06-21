@@ -59,6 +59,7 @@ import {
   messages,
   toolInvocations,
 } from "./schema.js";
+import { llmUsageEvents } from "./schema/infrastructure.js";
 import { cancelPendingJobsForConversation } from "./task-memory-cleanup.js";
 
 const log = getLogger("conversation-store");
@@ -225,10 +226,7 @@ export interface MessageRow {
   metadata: string | null;
 }
 
-const parseMessage = createRowMapper<
-  typeof messages.$inferSelect,
-  MessageRow
->({
+const parseMessage = createRowMapper<typeof messages.$inferSelect, MessageRow>({
   id: "id",
   conversationId: "conversationId",
   role: "role",
@@ -1066,6 +1064,23 @@ export function getMessagesPaginated(
   rows.reverse();
 
   return { messages: rows, hasMore };
+}
+
+export function getMainAgentUsageModels(
+  conversationId: string,
+): Array<{ at: number; model: string }> {
+  const db = getDb();
+  return db
+    .select({ at: llmUsageEvents.createdAt, model: llmUsageEvents.model })
+    .from(llmUsageEvents)
+    .where(
+      and(
+        eq(llmUsageEvents.conversationId, conversationId),
+        eq(llmUsageEvents.actor, "main_agent"),
+      ),
+    )
+    .orderBy(asc(llmUsageEvents.createdAt))
+    .all();
 }
 
 export function getLastAssistantTimestampBefore(

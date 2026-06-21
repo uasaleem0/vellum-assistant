@@ -44,6 +44,8 @@ export function recordUsageEvent(
       inputTokens: event.inputTokens,
       outputTokens: event.outputTokens,
       cacheCreationInputTokens: event.cacheCreationInputTokens,
+      cacheCreation5mTokens: input.cacheCreation5mTokens ?? null,
+      cacheCreation1hTokens: input.cacheCreation1hTokens ?? null,
       cacheReadInputTokens: event.cacheReadInputTokens,
       estimatedCostUsd: event.estimatedCostUsd,
       pricingStatus: event.pricingStatus,
@@ -215,7 +217,6 @@ interface TotalsRow {
   priced_event_count: number;
   unpriced_event_count: number;
 }
-
 
 interface GroupRow {
   group_key: string;

@@ -157,6 +157,7 @@ import {
   migrateStripIntegrationPrefixFromProviderKeys,
   migrateStripPlaceholderSentinelsFromMessages,
   migrateStripThinkingFromConsolidated,
+  migrateUsageCacheCreationTtlSplit,
   migrateUsageDashboardIndexes,
   migrateUsageLlmCallCount,
   migrateVoiceInviteColumns,
@@ -390,6 +391,7 @@ export function initializeDb(): void {
     migrate230AcpSessionHistory,
     migrate231RepairMemoryGraphEventDates,
     migrateActivationState,
+    migrateUsageCacheCreationTtlSplit,
   ];
 
   // Run each migration step, catching and logging individual failures so one
