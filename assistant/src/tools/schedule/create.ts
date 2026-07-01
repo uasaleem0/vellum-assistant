@@ -84,11 +84,17 @@ export async function executeScheduleCreate(
     }
   }
 
+  // Collect every independent, mode-agnostic field problem in one pass instead
+  // of returning on the first one. A model correcting these one at a time
+  // (name -> description -> mode -> message -> fire_at format -> fire_at
+  // timezone -> ...) plays error whack-a-mole across several retries, fixing
+  // whatever the last error mentioned while accidentally dropping an earlier
+  // field it now no longer sees a complaint about. Reporting all of them
+  // together lets a single retry fix everything.
+  const fieldErrors: string[] = [];
+
   if (!name || typeof name !== "string") {
-    return {
-      content: "Error: name is required and must be a string",
-      isError: true,
-    };
+    fieldErrors.push("name is required and must be a string");
   }
 
   if (
@@ -96,103 +102,89 @@ export async function executeScheduleCreate(
     typeof description !== "string" ||
     description.trim().length === 0
   ) {
-    return {
-      content: "Error: description is required and must be a non-empty string",
-      isError: true,
-    };
+    fieldErrors.push("description is required and must be a non-empty string");
   }
 
-  // Validate mode
   if (!VALID_MODES.includes(mode)) {
-    return {
-      content: `Error: mode must be one of: ${VALID_MODES.join(", ")}`,
-      isError: true,
-    };
-  }
-
-  // Mode-specific field validation
-  if (mode === "script") {
+    fieldErrors.push(`mode must be one of: ${VALID_MODES.join(", ")}`);
+  } else if (mode === "script") {
     if (!script || typeof script !== "string") {
-      return {
-        content:
-          "Error: script is required for script mode and must be a non-empty string",
-        isError: true,
-      };
+      fieldErrors.push(
+        "script is required for script mode and must be a non-empty string",
+      );
     }
   } else if (mode === "workflow") {
     // Workflow mode requires a saved workflow name — mirrors the HTTP route's
     // create-side validation so the assistant-facing path and the settings route
     // enforce the same shape.
     if (!workflowName) {
-      return {
-        content:
-          "Error: workflow_name is required for workflow mode and must be a non-empty string",
-        isError: true,
-      };
-    }
-    // A workflow schedule may carry a capability manifest — the single consent
-    // point for its eventual unattended run. Validate and normalize it here so a
-    // schedule can never persist a malformed or forbidden manifest: parse the
-    // declared shape, then run the same forbidden/unknown/host-tool checks
-    // resolveCapabilities applies at launch. A side-effecting manifest forces a
-    // fresh approval at CREATION (see executor.ts).
-    if (input.capabilities !== undefined) {
-      try {
-        const manifest = CapabilityManifestSchema.parse(input.capabilities);
-        resolveWorkflowCapabilities(manifest);
-        capabilities = manifest;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return {
-          content: `Error: invalid capabilities manifest: ${msg}`,
-          isError: true,
-        };
-      }
+      fieldErrors.push(
+        "workflow_name is required for workflow mode and must be a non-empty string",
+      );
     }
   } else {
     if (!message || typeof message !== "string") {
-      return {
-        content: "Error: message is required and must be a string",
-        isError: true,
-      };
+      fieldErrors.push("message is required and must be a string");
     }
   }
 
-  // Validate routing_intent
   if (
     routingIntent !== undefined &&
     !VALID_ROUTING_INTENTS.includes(routingIntent as RoutingIntent)
   ) {
-    return {
-      content: `Error: routing_intent must be one of: ${VALID_ROUTING_INTENTS.join(", ")}`,
-      isError: true,
-    };
+    fieldErrors.push(
+      `routing_intent must be one of: ${VALID_ROUTING_INTENTS.join(", ")}`,
+    );
+  }
+
+  if (fireAt) {
+    const fireAtMs = Date.parse(fireAt);
+    if (isNaN(fireAtMs)) {
+      fieldErrors.push(
+        "fire_at must be a valid ISO 8601 timestamp (e.g. 2025-06-15T09:00:00Z)",
+      );
+    } else {
+      // Require explicit timezone (Z, ±HH:MM, or ±HHMM offset) to avoid host-timezone ambiguity
+      if (!/(?:Z|[+-]\d{2}:?\d{2})\s*$/.test(fireAt)) {
+        fieldErrors.push(
+          "fire_at must include a timezone offset (e.g. 2025-06-15T09:00:00Z or 2025-06-15T09:00:00+05:30)",
+        );
+      }
+      if (fireAtMs <= Date.now()) {
+        fieldErrors.push("fire_at must be in the future");
+      }
+    }
+  }
+
+  if (fieldErrors.length > 0) {
+    return { content: `Error: ${fieldErrors.join("; ")}`, isError: true };
+  }
+
+  // A workflow schedule may carry a capability manifest — the single consent
+  // point for its eventual unattended run. Validate and normalize it here so a
+  // schedule can never persist a malformed or forbidden manifest: parse the
+  // declared shape, then run the same forbidden/unknown/host-tool checks
+  // resolveCapabilities applies at launch. A side-effecting manifest forces a
+  // fresh approval at CREATION (see executor.ts). Kept as its own early return
+  // (rather than folded into fieldErrors above) because parsing has real
+  // side effects and only applies once workflowName is already known-valid.
+  if (mode === "workflow" && input.capabilities !== undefined) {
+    try {
+      const manifest = CapabilityManifestSchema.parse(input.capabilities);
+      resolveWorkflowCapabilities(manifest);
+      capabilities = manifest;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: `Error: invalid capabilities manifest: ${msg}`,
+        isError: true,
+      };
+    }
   }
 
   // ── One-shot schedule (fire_at) ──────────────────────────────────
   if (fireAt) {
     const fireAtMs = Date.parse(fireAt);
-    if (isNaN(fireAtMs)) {
-      return {
-        content:
-          "Error: fire_at must be a valid ISO 8601 timestamp (e.g. 2025-06-15T09:00:00Z)",
-        isError: true,
-      };
-    }
-    // Require explicit timezone (Z, ±HH:MM, or ±HHMM offset) to avoid host-timezone ambiguity
-    if (!/(?:Z|[+-]\d{2}:?\d{2})\s*$/.test(fireAt)) {
-      return {
-        content:
-          "Error: fire_at must include a timezone offset (e.g. 2025-06-15T09:00:00Z or 2025-06-15T09:00:00+05:30)",
-        isError: true,
-      };
-    }
-    if (fireAtMs <= Date.now()) {
-      return {
-        content: "Error: fire_at must be in the future",
-        isError: true,
-      };
-    }
 
     try {
       const job = createSchedule({

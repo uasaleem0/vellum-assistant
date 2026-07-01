@@ -36,6 +36,9 @@ type SupportedType =
   | "array"
   | "object";
 
+const ACTIVITY_KEY = "activity";
+const ACTIVITY_PROPERTY_SCHEMA: Record<string, unknown> = { type: "string" };
+
 const SUPPORTED_TYPES: ReadonlySet<string> = new Set([
   "string",
   "number",
@@ -118,8 +121,19 @@ export function validateInputAgainstSchema(
   // Skip when there's no schema or no properties block — matches today's
   // lenient behaviour for tools that declare only `{ type: "object" }`.
   if (!schema) return { ok: true };
-  const properties = schema.properties;
-  if (!isPlainObject(properties)) return { ok: true };
+  const rawProperties = schema.properties;
+  if (!isPlainObject(rawProperties)) return { ok: true };
+
+  // `activity` (a brief "what am I doing" status string) is injected into
+  // every native/MCP tool's schema by `injectActivityField`
+  // (tools/schema-transforms.ts), but skill tools' TOOLS.json manifests never
+  // declare it. Models learn the convention from the rest of the toolset and
+  // include it on skill-tool calls anyway, so accept it here too rather than
+  // rejecting an otherwise-valid call for a field every other tool allows.
+  const properties =
+    ACTIVITY_KEY in rawProperties
+      ? rawProperties
+      : { ...rawProperties, [ACTIVITY_KEY]: ACTIVITY_PROPERTY_SCHEMA };
 
   const errors: string[] = [];
   const knownKeys = Object.keys(properties);

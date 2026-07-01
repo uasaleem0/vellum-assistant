@@ -288,8 +288,28 @@ describe("validateInputAgainstSchema — unknown keys", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.errors).toContain(
-      'Unknown parameter "foo". Supported: "surface_id", "content", "mode"',
+      'Unknown parameter "foo". Supported: "surface_id", "content", "mode", "activity"',
     );
+  });
+
+  test("accepts the universal activity field even though the schema doesn't declare it", () => {
+    const result = validateInputAgainstSchema(
+      "t",
+      { surface_id: "doc", content: "x", activity: "Doing a thing" },
+      schema,
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  test("rejects a non-string activity value", () => {
+    const result = validateInputAgainstSchema(
+      "t",
+      { surface_id: "doc", content: "x", activity: 123 },
+      schema,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors).toContain("activity must be a string");
   });
 
   test("flags multiple unknown keys individually", () => {
