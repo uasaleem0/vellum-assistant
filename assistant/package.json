@@ -22,6 +22,7 @@
     "lint": "eslint",
     "lint:unused": "knip --include files,dependencies,unlisted",
     "lint:circular": "bun run scripts/check-circular-deps.ts",
+    "lint:tool-refs": "bun run scripts/check-tool-references.ts",
     "lint:unused:production": "knip --production --include exports",
     "typecheck": "bunx tsc --noEmit",
     "test": "bash scripts/test.sh",
