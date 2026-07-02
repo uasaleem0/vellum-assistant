@@ -96,8 +96,8 @@ describe("schedule_create tool description", () => {
     );
   });
 
-  test("redirects to task_list_add for task queue items", () => {
-    expect(scheduleCreateDef.description).toContain("task_list_add");
+  test("redirects to create_task for task queue items", () => {
+    expect(scheduleCreateDef.description).toContain("create_task");
   });
 
   test("does NOT suggest it handles task queue items", () => {
@@ -111,8 +111,8 @@ describe("schedule_create tool description", () => {
 // =====================================================================
 
 describe("cross-tool routing consistency", () => {
-  test("schedule_create redirects task requests to task_list_add", () => {
-    expect(scheduleCreateDef.description).toContain("task_list_add");
+  test("schedule_create redirects task requests to create_task", () => {
+    expect(scheduleCreateDef.description).toContain("create_task");
   });
 
   test('schedule_create rejects "add to my queue" usage', () => {
