@@ -1637,6 +1637,8 @@ async function main() {
 
   const server = Bun.serve({
     port: config.port,
+    // VAL-CUSTOM-PATCH: allow binding to loopback (nginx fronts this box).
+    hostname: process.env.GATEWAY_BIND_HOST || undefined,
     idleTimeout: 0,
     // Match the daemon's 512 MB limit (assistant/src/runtime/http-server.ts)
     // so large .vbundle imports proxied through the gateway aren't rejected.
@@ -1747,7 +1749,9 @@ async function main() {
           method: req.method,
           headers: req.headers,
           body:
-            req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
+            req.method !== "GET" && req.method !== "HEAD"
+              ? req.body
+              : undefined,
         });
         return await fetch(bridgeReq);
       } catch {
