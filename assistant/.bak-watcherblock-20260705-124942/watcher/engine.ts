@@ -31,15 +31,6 @@ import {
 
 const log = getLogger("watcher-engine");
 
-const WATCHER_BLOCKED_TOOL_NAMES: readonly string[] = [
-  "messaging_send",           // email/DM send + Gmail draft-send
-  "messaging_archive_by_sender", // bulk mailbox mutation
-  "contact_merge",            // deletes a contact
-  "call_start",               // places an outbound phone call
-  "sequence_enroll",          // kicks off an automated outbound email sequence
-  "subagent_spawn",           // closes the subagent bypass
-];
-
 export type WatcherNotifier = (notification: {
   title: string;
   body: string;
@@ -271,10 +262,6 @@ export async function runWatchersOnce(
       callSite: "mainAgent",
       timeoutMs: WATCHER_JOB_TIMEOUT_MS,
       origin: "watcher",
-      // Guardian-trust watcher turns run with the full tool surface; hard-block
-      // every send/write/irreversible-external tool so triage can only read,
-      // draft locally, notify, and remember — never act on the user's behalf.
-      blockedToolNames: WATCHER_BLOCKED_TOOL_NAMES,
       assistantSandwich: {
         preamble,
         content: sandwichContent,

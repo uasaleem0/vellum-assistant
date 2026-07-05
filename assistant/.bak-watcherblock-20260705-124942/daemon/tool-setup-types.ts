@@ -80,8 +80,6 @@ export interface ToolSetupContext extends SurfaceConversationContext {
   subagentToolGateMode?: SubagentToolGateMode;
   /** Turn-scoped disk-pressure cleanup mode flag. */
   diskPressureCleanupModeActive?: boolean;
-  /** Turn-scoped hard tool blocklist — names removed from `allowedToolNames`. */
-  blockedToolNames?: Set<string>;
   /** True when the conversation has no connected client (HTTP-only path). */
   hasNoClient?: boolean;
   /** When true, the conversation is executing a task run and must not become interactive. */
