@@ -288,7 +288,7 @@ describe("runBackgroundJob", () => {
     expect(bootstrapLastArgs).not.toHaveProperty("scheduleJobId");
   });
 
-  test("assistantSandwich seeds three messages in user/assistant/user order, with sandwich written before processMessage runs", async () => {
+  test("assistantSandwich with empty prompt: postamble is delivered as the processMessage prompt (persistUserMessage rejects empty content)", async () => {
     let addMessageCountAtProcessMessageStart = -1;
     processMessageImpl = async () => {
       addMessageCountAtProcessMessageStart = addMessageCalls.length;
@@ -306,8 +306,10 @@ describe("runBackgroundJob", () => {
       }),
     );
 
-    // All three sandwich addMessage calls happened.
-    expect(addMessageCalls).toHaveLength(3);
+    // Only preamble + content are pre-seeded; the postamble arrives via
+    // processMessage so the persisted transcript is identical but the
+    // user-message content is never empty.
+    expect(addMessageCalls).toHaveLength(2);
     expect(addMessageCalls[0]).toMatchObject({
       conversationId: STUB_CONVERSATION_ID,
       role: "user",
@@ -318,15 +320,32 @@ describe("runBackgroundJob", () => {
       role: "assistant",
       content: "UNTRUSTED_PAYLOAD",
     });
+    expect(processMessageCalls).toHaveLength(1);
+    expect(processMessageCalls[0].content).toBe("TRUSTED_POST");
+    // processMessage observed both seeded sandwich messages already in place.
+    expect(addMessageCountAtProcessMessageStart).toBe(2);
+  });
+
+  test("assistantSandwich with a non-empty prompt seeds all three messages and passes the prompt through", async () => {
+    await runBackgroundJob(
+      baseOpts({
+        prompt: "KICKER",
+        assistantSandwich: {
+          preamble: "TRUSTED_PRE",
+          content: "UNTRUSTED_PAYLOAD",
+          postamble: "TRUSTED_POST",
+        },
+      }),
+    );
+
+    expect(addMessageCalls).toHaveLength(3);
     expect(addMessageCalls[2]).toMatchObject({
       conversationId: STUB_CONVERSATION_ID,
       role: "user",
       content: "TRUSTED_POST",
     });
     expect(processMessageCalls).toHaveLength(1);
-    expect(processMessageCalls[0].content).toBe("");
-    // processMessage observed all 3 sandwich messages already in place.
-    expect(addMessageCountAtProcessMessageStart).toBe(3);
+    expect(processMessageCalls[0].content).toBe("KICKER");
   });
 
   describe("pre-first-message gate", () => {
