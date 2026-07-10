@@ -123,9 +123,10 @@ export interface RunBackgroundJobOptions {
    *      treats it as its own past output, not as user instructions).
    *   3. `user` role: `postamble`    — static, trusted action prompt.
    *
-   * `processMessage` is then invoked with whatever `prompt` the caller set
-   * (often empty or a short kicker) since the conversation already carries
-   * the seed.
+   * `processMessage` is then invoked with whatever `prompt` the caller set.
+   * If `prompt` is empty, the `postamble` is delivered as the
+   * `processMessage` prompt instead of message 3 above — persistUserMessage
+   * rejects empty content, and the resulting transcript is identical.
    *
    * Used by the watcher engine to ingest external provider events safely:
    * a malicious Linear title or Gmail subject reaches the model only in
@@ -256,6 +257,12 @@ export async function runBackgroundJob(
     // messages. The LLM treats assistant-role content as its own prior
     // output, not as user instructions, so a malicious payload (e.g. a
     // crafted Linear title) cannot override the postamble's action prompt.
+    // When the caller supplies no prompt (watcher turns), the postamble is
+    // delivered AS the processMessage prompt instead of a pre-seeded message:
+    // persistUserMessage rejects empty content, and the resulting transcript
+    // (preamble/user, content/assistant, postamble/user) is identical.
+    const deliverPostambleAsPrompt =
+      opts.assistantSandwich !== undefined && opts.prompt.trim() === "";
     if (opts.assistantSandwich) {
       await addMessage(
         conversation.id,
@@ -269,15 +276,20 @@ export async function runBackgroundJob(
         opts.assistantSandwich.content,
         { skipIndexing: true },
       );
-      await addMessage(
-        conversation.id,
-        "user",
-        opts.assistantSandwich.postamble,
-        { skipIndexing: true },
-      );
+      if (!deliverPostambleAsPrompt) {
+        await addMessage(
+          conversation.id,
+          "user",
+          opts.assistantSandwich.postamble,
+          { skipIndexing: true },
+        );
+      }
     }
 
-    const work = processMessage(conversation.id, opts.prompt, {
+    const effectivePrompt = deliverPostambleAsPrompt
+      ? opts.assistantSandwich!.postamble
+      : opts.prompt;
+    const work = processMessage(conversation.id, effectivePrompt, {
       trustContext: opts.trustContext,
       callSite: opts.callSite,
       ...(opts.overrideProfile

@@ -41,7 +41,7 @@ beforeEach(() => {
   __clearRegistryForTesting();
   getConfigSpy = spyOn(configLoader, "getConfig").mockReturnValue({
     tools: { exclude: [] },
-  } as AssistantConfig);
+  } as unknown as AssistantConfig);
 });
 
 afterEach(() => {

@@ -32,12 +32,12 @@ import {
 const log = getLogger("watcher-engine");
 
 const WATCHER_BLOCKED_TOOL_NAMES: readonly string[] = [
-  "messaging_send",           // email/DM send + Gmail draft-send
+  "messaging_send", // email/DM send + Gmail draft-send
   "messaging_archive_by_sender", // bulk mailbox mutation
-  "contact_merge",            // deletes a contact
-  "call_start",               // places an outbound phone call
-  "sequence_enroll",          // kicks off an automated outbound email sequence
-  "subagent_spawn",           // closes the subagent bypass
+  "contact_merge", // deletes a contact
+  "call_start", // places an outbound phone call
+  "sequence_enroll", // kicks off an automated outbound email sequence
+  "subagent_spawn", // closes the subagent bypass
 ];
 
 export type WatcherNotifier = (notification: {
