@@ -438,6 +438,8 @@ export interface SkillProjectionContext {
   readonly hasNoClient?: boolean;
   /** When set, only tools in this set are included in the resolved tool list (subagent delegation). */
   subagentAllowedTools?: Set<string>;
+  /** When set, these tool names are removed from the turn execution allowlist. */
+  blockedToolNames?: Set<string>;
   /**
    * How {@link subagentAllowedTools} is enforced — see
    * {@link SubagentToolGateMode}. Absent means `"wire"`.
@@ -796,6 +798,13 @@ export function createResolveToolsCallback(
       }
       if (excluded.has(name)) continue;
       turnAllowed.add(name);
+    }
+    // Hard per-turn blocklist (e.g. watcher triage turns must never send/write).
+    // Removing from turnAllowed feeds both the normal gate (ctx.allowedToolNames
+    // below) and the disk-pressure branch (which filters turnAllowed), so a
+    // blocked tool stays visible on the wire but is rejected before execution.
+    if (ctx.blockedToolNames) {
+      for (const blocked of ctx.blockedToolNames) turnAllowed.delete(blocked);
     }
     // Record the full resolved inventory durably for read-only queries before
     // any degraded-mode narrowing below — `allowedToolNames` is the per-turn

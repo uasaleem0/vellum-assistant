@@ -71,6 +71,8 @@ type ProcessMessageOptions = ConversationCreateOptions & {
   sourceChannel?: string;
   /** Originating interface (e.g. "cli", "web"). Defaults to "web". */
   sourceInterface?: string;
+  /** Per-turn hard tool blocklist — removed from the turn execution allowlist. */
+  blockedToolNames?: readonly string[];
 };
 
 function buildEventEmitter(
@@ -145,6 +147,7 @@ async function prepareConversationForMessage(
     attachmentIds,
     sourceChannel,
     sourceInterface,
+    blockedToolNames,
     onEvent: _onEvent,
     ...conversationOptions
   } = options ?? {};
@@ -168,6 +171,9 @@ async function prepareConversationForMessage(
     options?.assistantId ?? DAEMON_INTERNAL_ASSISTANT_ID,
   );
   conversation.taskRunId = options?.taskRunId;
+  conversation.blockedToolNames = blockedToolNames
+    ? new Set(blockedToolNames)
+    : undefined;
   if (options?.trustContext !== undefined) {
     conversation.setTrustContext(options.trustContext);
   }

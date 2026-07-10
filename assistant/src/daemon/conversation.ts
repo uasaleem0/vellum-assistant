@@ -270,6 +270,13 @@ export class Conversation {
    */
   lastResolvedToolNames?: Set<string>;
   /** @internal */ diskPressureCleanupModeActive?: boolean;
+  /**
+   * Per-turn hard tool blocklist. Names here are subtracted from the turn
+   * execution allowlist in `createResolveToolsCallback`, so calls are rejected
+   * before the executor runs. Set by `processMessage` from `blockedToolNames`.
+   * @internal
+   */
+  blockedToolNames?: Set<string>;
   /** @internal */ toolsDisabledDepth = 0;
   /** @internal */ preactivatedSkillIds?: string[];
   /** @internal */ subagentAllowedTools?: Set<string>;

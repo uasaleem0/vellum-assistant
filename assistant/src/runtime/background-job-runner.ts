@@ -137,6 +137,13 @@ export interface RunBackgroundJobOptions {
    * run completes successfully. See `notifications/deferred-emit.ts`.
    */
   deferNotifications?: boolean;
+  /**
+   * Per-turn hard tool blocklist. Every name here is removed from the turn
+   * execution allowlist, so the model may still see the tool on the wire but
+   * any call is rejected before its executor runs. Used by the watcher engine
+   * to guarantee triage turns cannot send/write regardless of prompt.
+   */
+  blockedToolNames?: readonly string[];
 }
 
 export interface RunBackgroundJobResult {
@@ -275,6 +282,9 @@ export async function runBackgroundJob(
       callSite: opts.callSite,
       ...(opts.overrideProfile
         ? { overrideProfile: opts.overrideProfile }
+        : {}),
+      ...(opts.blockedToolNames
+        ? { blockedToolNames: opts.blockedToolNames }
         : {}),
     });
     // Absorb late rejections: if the timeout wins the race, `work` keeps
