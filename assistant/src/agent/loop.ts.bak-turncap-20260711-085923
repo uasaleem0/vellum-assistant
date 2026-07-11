@@ -1057,15 +1057,6 @@ export class AgentLoop {
         break;
       }
 
-      if (toolUseTurns >= MAX_TOOL_USE_TURNS) {
-        rlog.warn(
-          { turn: toolUseTurns, messageCount: history.length },
-          "Agent loop hit MAX_TOOL_USE_TURNS backstop; forcing terminal stop",
-        );
-        await stopTurn("max_tool_turns");
-        break;
-      }
-
       rlog.info(
         { turn: toolUseTurns, messageCount: history.length },
         "Agent loop iteration start",
