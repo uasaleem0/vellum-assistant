@@ -412,6 +412,19 @@ const DEFAULT_CONFIG: AgentLoopConfig = {
  */
 const MAX_POST_MODEL_CALL_CONTINUES = 5;
 
+/**
+ * Hard backstop on tool-use iterations within a single agent turn. The loop
+ * otherwise terminates only when the model emits a tool-free assistant message;
+ * a model that returns a tool call every turn (observed 2026-07-11 when a
+ * memory-retrospective run called `remember` in an unbroken 1389-turn loop,
+ * re-sending its whole growing history each iteration) would run unbounded and
+ * bleed cost. Set far above any legitimate turn (real turns rarely exceed ~20
+ * tool iterations; deep autonomous runs stay well under this) so it only trips
+ * on the pathological case. Applies to every surface (chat, voice, scheduled,
+ * autonomous).
+ */
+const MAX_TOOL_USE_TURNS = 150;
+
 const MAX_TOKENS_STOP_REASONS = new Set([
   "length",
   "max_output_tokens",
@@ -1041,6 +1054,15 @@ export class AgentLoop {
     while (true) {
       if (signal?.aborted) {
         await stopTurn("aborted_pre_call");
+        break;
+      }
+
+      if (toolUseTurns >= MAX_TOOL_USE_TURNS) {
+        rlog.warn(
+          { turn: toolUseTurns, messageCount: history.length },
+          "Agent loop hit MAX_TOOL_USE_TURNS backstop; forcing terminal stop",
+        );
+        await stopTurn("max_tool_turns");
         break;
       }
 

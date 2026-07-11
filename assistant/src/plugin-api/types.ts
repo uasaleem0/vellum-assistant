@@ -404,6 +404,12 @@ export type AgentLoopExitReason =
   | "aborted_after_checkpoint"
   /** User cancellation observed while the catch handler synthesized an error turn. */
   | "aborted_via_error"
+  /**
+   * Hard backstop: the turn hit MAX_TOOL_USE_TURNS tool-use iterations without
+   * the model ever emitting a tool-free reply. Bounds a pathological loop
+   * (e.g. a retrospective that calls `remember` every turn).
+   */
+  | "max_tool_turns"
   /** An unhandled error ended the turn. */
   | "error";
 
