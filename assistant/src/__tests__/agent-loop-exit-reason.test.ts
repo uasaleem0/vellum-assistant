@@ -193,6 +193,50 @@ describe("AgentLoop exit-reason instrumentation", () => {
     expect(isMaxTokensStopReason(undefined)).toBe(false);
   });
 
+  test("hard-stops with max_tool_turns when the model never stops calling tools", async () => {
+    // Regression guard for the 2026-07-11 runaway: a memory-retrospective run
+    // whose model emitted a `remember` tool call every turn looped 1389 times,
+    // re-sending its growing history each iteration. The single mock response
+    // repeats forever (mock last-response fallback) and the executor always
+    // succeeds, so only the MAX_TOOL_USE_TURNS backstop can terminate the run.
+    const { provider } = createMockProvider([
+      toolUseResponse("t1", "read_file", { path: "/a.txt" }),
+    ]);
+    const toolExecutor = async () => ({ content: "ok", isError: false });
+    const loop = new AgentLoop({
+      provider: provider,
+      systemPrompt: "system",
+      conversationId: "test-conversation",
+      tools: dummyTools,
+      toolExecutor: toolExecutor,
+    });
+
+    const events: AgentEvent[] = [];
+    await loop.run({
+      requestId: "test-request",
+      messages: [userMessage],
+      onEvent: (e) => {
+        events.push(e);
+      },
+      trust: { sourceChannel: "vellum", trustClass: "unknown" },
+      // Large window + recovery off: isolate the backstop from the budget gate.
+      resolveContextWindow: () => ({
+        maxInputTokens: 10_000_000,
+        overflowRecovery: { enabled: false, safetyMarginRatio: 0 },
+      }),
+    });
+
+    // Terminates exactly once, via the backstop, not by running unbounded.
+    expect(countExitEvents(events)).toBe(1);
+    expect(lastExitEvent(events)?.reason).toBe("max_tool_turns");
+    // The ceiling bounds provider calls to MAX_TOOL_USE_TURNS (150): calls fire
+    // for turns 0..149, then the top-of-loop check trips before call 151.
+    const llmCalls = events.filter((e) => e.type === "llm_call_started").length;
+    expect(llmCalls).toBe(150);
+    // ~150 real loop iterations through the full hook chain exceed the 5s
+    // default; the assertion (not the wall-clock) is what guards the ceiling.
+  }, 30000);
+
   test("emits exit event exactly once with 'no_tool_calls' on plain text response", async () => {
     const { provider } = createMockProvider([textResponse("Hi there!")]);
     const loop = new AgentLoop({
