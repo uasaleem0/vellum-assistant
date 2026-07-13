@@ -4,6 +4,7 @@ import { type TrustClass } from "../runtime/actor-trust-resolver.js";
 import { resolveCapabilities } from "../runtime/capabilities.js";
 import { getLogger } from "../util/logger.js";
 import { isAutoAnalysisConversation } from "./auto-analysis-guard.js";
+import { getConversation } from "./conversation-crud.js";
 import { isMemoryEnabled, upsertAutoAnalysisJob } from "./jobs-store.js";
 import { isMemoryRetrospectiveConversation } from "./memory-retrospective-enqueue.js";
 
@@ -80,6 +81,31 @@ export function enqueueAutoAnalysisIfEnabled(args: {
     log.debug(
       { conversationId, trigger },
       "Skipping auto-analysis enqueue: source is a memory-retrospective conversation",
+    );
+    return;
+  }
+
+  // Allowlist-by-type root guard (cost runaway 2026-07-13). Auto-analysis must
+  // only ever run on FOREGROUND conversations (user-facing `standard` and
+  // `scheduled` routines). EVERY `background` conversation is skipped by type:
+  // memory consolidation, retrospective forks, heartbeat, filing,
+  // updates_bulletin, watchers, tasks, AND any future machine-generated source.
+  //
+  // Why by type, not by named source: the incident that motivated this was a
+  // self-sustaining loop — a memory-consolidation conversation was auto-analyzed
+  // (analysis writes memory -> buffer over size trigger -> new consolidation ->
+  // new consolidation conversation -> analyzed again -> ...). The guard here was
+  // previously a blocklist of named sources; it skipped `auto-analysis` and
+  // `memory-retrospective` but NOT `memory_v2_consolidation`. A blocklist always
+  // eventually misses a newly-added source. Gating on `conversation_type` closes
+  // the entire class: a background conversation is machine output, the analysis
+  // agent already writes memory directly, so re-analyzing it only re-stores
+  // already-captured facts (and can loop).
+  const conversation = getConversation(conversationId);
+  if (conversation?.conversationType === "background") {
+    log.debug(
+      { conversationId, trigger, source: conversation.source },
+      "Skipping auto-analysis enqueue: background conversation (allowlist-by-type root guard)",
     );
     return;
   }

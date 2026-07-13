@@ -1,5 +1,10 @@
 import type { RateLimitConfig } from "../config/types.js";
 import { RateLimitError } from "../util/errors.js";
+import {
+  backgroundCallCapPerHour,
+  backgroundCallsInLastHour,
+  recordBackgroundCall,
+} from "./background-rate-limit.js";
 import { getLogger } from "../util/logger.js";
 import type {
   Message,
@@ -43,6 +48,10 @@ export class RateLimitProvider implements Provider {
     // calls from bypassing the rate limit during the async gap.
     this.recordRequest();
 
+    // Global background-LLM circuit breaker (defense-in-depth). No-op for
+    // `mainAgent` (live user turns) and when disabled. Fails open.
+    this.enforceBackgroundCircuit(options);
+
     const response = await this.inner.sendMessage(messages, options);
 
     return response;
@@ -84,6 +93,42 @@ export class RateLimitProvider implements Provider {
         `Rate limit exceeded: ${limit} requests/minute. Try again in ${waitSec}s.`,
       );
     }
+  }
+
+  // Global background-LLM circuit breaker. Bounds background (non-`mainAgent`)
+  // provider calls per rolling hour across the whole daemon, so a runaway in
+  // ANY background path (a new watcher, a self-re-enqueuing job, a missed
+  // recursion guard) cannot spend unbounded even if every per-source guard is
+  // bypassed. User-facing `mainAgent` turns are never counted or gated. Fails
+  // OPEN: any internal error here proceeds with the call rather than blocking
+  // the assistant. See background-rate-limit.ts.
+  private enforceBackgroundCircuit(options?: SendMessageOptions): void {
+    let tripped: RateLimitError | null = null;
+    try {
+      const callSite = options?.callSite;
+      // Only known background call-sites are gated; `mainAgent` and
+      // unknown/undefined call-sites are always admitted.
+      if (!callSite || callSite === "mainAgent") return;
+      const cap = backgroundCallCapPerHour();
+      if (cap <= 0) return; // breaker disabled
+      const count = backgroundCallsInLastHour();
+      if (count >= cap) {
+        log.error(
+          { callSite, count, cap },
+          "[BACKGROUND CIRCUIT BREAKER] hourly background LLM call cap reached; rejecting background call. User-facing calls are unaffected. Tune via BACKGROUND_MAX_CALLS_PER_HOUR (0 disables).",
+        );
+        tripped = new RateLimitError(
+          `Background LLM circuit open: ${count} background calls in the last hour (cap ${cap}). Background work paused; user-facing calls unaffected.`,
+        );
+      } else {
+        recordBackgroundCall();
+      }
+    } catch (err) {
+      // Fail OPEN — the breaker must never itself break the assistant.
+      log.warn({ err }, "background circuit breaker internal error; failing open");
+      return;
+    }
+    if (tripped) throw tripped;
   }
 
   private recordRequest(): void {
