@@ -4,9 +4,7 @@ import { type TrustClass } from "../runtime/actor-trust-resolver.js";
 import { resolveCapabilities } from "../runtime/capabilities.js";
 import { getLogger } from "../util/logger.js";
 import { isAutoAnalysisConversation } from "./auto-analysis-guard.js";
-import { getConversationSource } from "./conversation-crud.js";
 import { isMemoryEnabled, upsertAutoAnalysisJob } from "./jobs-store.js";
-import { MEMORY_V2_CONSOLIDATION_SOURCE } from "./v2/constants.js";
 import { isMemoryRetrospectiveConversation } from "./memory-retrospective-enqueue.js";
 
 const log = getLogger("auto-analysis-enqueue");
@@ -82,22 +80,6 @@ export function enqueueAutoAnalysisIfEnabled(args: {
     log.debug(
       { conversationId, trigger },
       "Skipping auto-analysis enqueue: source is a memory-retrospective conversation",
-    );
-    return;
-  }
-
-  // Recursion guard (cost runaway 2026-07-13): memory-consolidation
-  // conversations must never be auto-analyzed. Analysis writes memory ->
-  // the memory buffer exceeds its size trigger -> a new memory_v2_consolidate
-  // fires -> that consolidation runs as its own conversation -> which would be
-  // analyzed again, ad infinitum. The memory-retrospective path already skips
-  // this source via isLowYieldRetrospectiveSource; auto-analysis lacked the
-  // equivalent guard, which let ~3.6k background forks (each a full-index
-  // memoryRouter call) run in ~7h. Mirrors that sibling guard.
-  if (getConversationSource(conversationId) === MEMORY_V2_CONSOLIDATION_SOURCE) {
-    log.debug(
-      { conversationId, trigger },
-      "Skipping auto-analysis enqueue: source is a memory-consolidation conversation",
     );
     return;
   }
