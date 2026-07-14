@@ -39,6 +39,15 @@ export const MemoryRetrospectiveConfigSchema = z
         "Minimum milliseconds between attempts (success or failure). Prevents tight retry loops across trigger types. Pre-compaction bypasses this gate.",
       ),
 
+    maxRunsPerHour: z
+      .number({ error: "memory.retrospective.maxRunsPerHour must be a number" })
+      .int("memory.retrospective.maxRunsPerHour must be an integer")
+      .positive("memory.retrospective.maxRunsPerHour must be a positive integer")
+      .default(60)
+      .describe(
+        "Global circuit breaker: max retrospective forks that may RUN per rolling hour across ALL conversations. Defense-in-depth sibling to the per-turn MAX_TOOL_USE_TURNS backstop — bounds run COUNT, not one run's tool loop. Normal peak is well under this; a runaway is 10-30x it. In-memory window, reset on daemon restart.",
+      ),
+
     keepSupersededRuns: z
       .boolean({
         error: "memory.retrospective.keepSupersededRuns must be a boolean",

@@ -56,6 +56,10 @@ import type { SystemPromptPersonaOverride } from "../prompts/system-prompt.js";
 import { wakeAgentForOpportunity } from "../runtime/agent-wake.js";
 import { getLogger } from "../util/logger.js";
 import {
+  recordRetrospectiveRun,
+  retrospectiveRunsInLastHour,
+} from "./memory-retrospective-rate-limit.js";
+import {
   addMessage,
   type ConversationRow,
   deleteConversation,
@@ -98,6 +102,7 @@ export type MemoryRetrospectiveOutcome =
   | { kind: "disabled" }
   | { kind: "no_new_messages" }
   | { kind: "source_processing" }
+  | { kind: "rate_limited"; runsThisHour: number; maxRunsPerHour: number }
   | { kind: "wake_failed"; reason?: string; conversationId?: string }
   | {
       kind: "invoked";
@@ -178,6 +183,26 @@ async function runForkBasedRetrospective(
     return { kind: "no_new_messages" };
   }
   const cutoffMessageId = cutoffMessage.id;
+
+  // ── Global hourly circuit breaker (defense-in-depth) ───────────────────────
+  // MAX_TOOL_USE_TURNS (agent/loop.ts) bounds ONE fork's tool loop; this bounds
+  // how many forks RUN per rolling hour across ALL conversations, so a
+  // re-enqueue cycle or many-source burst can't spend unbounded even though
+  // each fork is already turn-capped. Enforced here — after the cheap
+  // early-returns, before committing to the expensive fork+wake. Bump lastRunAt
+  // (apply cooldown) and leave lastProcessedMessageId untouched so the skipped
+  // window is reprocessed once the burst subsides — nothing is lost.
+  const maxRunsPerHour = config.memory.retrospective.maxRunsPerHour;
+  const runsThisHour = retrospectiveRunsInLastHour();
+  if (runsThisHour >= maxRunsPerHour) {
+    bumpRetrospectiveLastRunAt(sourceConversationId, Date.now());
+    log.error(
+      { sourceConversationId, runsThisHour, maxRunsPerHour },
+      "[MEMORY-RETROSPECTIVE CIRCUIT BREAKER] hourly run cap reached; skipping run. Raise memory.retrospective.maxRunsPerHour if this is a false trip.",
+    );
+    return { kind: "rate_limited", runsThisHour, maxRunsPerHour };
+  }
+  recordRetrospectiveRun();
 
   // The fork carries the full conversation, so the agent needs an explicit
   // anchor telling it where the review window begins. Prefer the user
