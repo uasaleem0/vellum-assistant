@@ -1,11 +1,14 @@
 import type { RateLimitConfig } from "../config/types.js";
 import { RateLimitError } from "../util/errors.js";
+import { getLogger } from "../util/logger.js";
 import {
+  autonomousCallCapPerHour,
+  autonomousCallsInLastHour,
   backgroundCallCapPerHour,
   backgroundCallsInLastHour,
+  recordAutonomousCall,
   recordBackgroundCall,
 } from "./background-rate-limit.js";
-import { getLogger } from "../util/logger.js";
 import type {
   Message,
   Provider,
@@ -48,9 +51,10 @@ export class RateLimitProvider implements Provider {
     // calls from bypassing the rate limit during the async gap.
     this.recordRequest();
 
-    // Global background-LLM circuit breaker (defense-in-depth). No-op for
-    // `mainAgent` (live user turns) and when disabled. Fails open.
-    this.enforceBackgroundCircuit(options);
+    // Global LLM circuit breakers (defense-in-depth): background calls and
+    // autonomous mainAgent turns each have their own rolling-hour window.
+    // Live user turns are never gated. Fails open.
+    this.enforceCircuitBreakers(options);
 
     const response = await this.inner.sendMessage(messages, options);
 
@@ -95,37 +99,67 @@ export class RateLimitProvider implements Provider {
     }
   }
 
-  // Global background-LLM circuit breaker. Bounds background (non-`mainAgent`)
-  // provider calls per rolling hour across the whole daemon, so a runaway in
-  // ANY background path (a new watcher, a self-re-enqueuing job, a missed
-  // recursion guard) cannot spend unbounded even if every per-source guard is
-  // bypassed. User-facing `mainAgent` turns are never counted or gated. Fails
-  // OPEN: any internal error here proceeds with the call rather than blocking
-  // the assistant. See background-rate-limit.ts.
-  private enforceBackgroundCircuit(options?: SendMessageOptions): void {
+  // Global LLM circuit breakers. Two rolling-hour windows (see
+  // background-rate-limit.ts):
+  //   1. background — every non-`mainAgent` call (memory jobs, analysis,
+  //      classifiers, ...), so a runaway in ANY background path cannot spend
+  //      unbounded even if every per-source guard is bypassed.
+  //   2. autonomous — `mainAgent` turns no human initiated (schedule, watcher,
+  //      wake; tagged `turnOrigin: "autonomous"` by the agent loop), so a
+  //      wake/schedule storm is bounded too.
+  // Live user turns (`mainAgent` without the autonomous tag) are never counted
+  // or gated. Fails OPEN: any internal error here proceeds with the call
+  // rather than blocking the assistant.
+  //
+  // NOTE: `callSite`/`turnOrigin` live on `options.config` (SendMessageConfig)
+  // — that is the shape every production caller sends. The original breaker
+  // read a top-level `options.callSite` that no caller sets, which made it
+  // silently inert; keep the top-level read only as a fallback.
+  private enforceCircuitBreakers(options?: SendMessageOptions): void {
     let tripped: RateLimitError | null = null;
     try {
-      const callSite = options?.callSite;
-      // Only known background call-sites are gated; `mainAgent` and
-      // unknown/undefined call-sites are always admitted.
-      if (!callSite || callSite === "mainAgent") return;
-      const cap = backgroundCallCapPerHour();
-      if (cap <= 0) return; // breaker disabled
-      const count = backgroundCallsInLastHour();
-      if (count >= cap) {
-        log.error(
-          { callSite, count, cap },
-          "[BACKGROUND CIRCUIT BREAKER] hourly background LLM call cap reached; rejecting background call. User-facing calls are unaffected. Tune via BACKGROUND_MAX_CALLS_PER_HOUR (0 disables).",
-        );
-        tripped = new RateLimitError(
-          `Background LLM circuit open: ${count} background calls in the last hour (cap ${cap}). Background work paused; user-facing calls unaffected.`,
-        );
+      const config = options?.config;
+      const callSite =
+        config?.callSite ??
+        (options as { callSite?: string } | undefined)?.callSite;
+      // Unknown/undefined call-sites are always admitted.
+      if (!callSite) return;
+
+      if (callSite === "mainAgent") {
+        if (config?.turnOrigin !== "autonomous") return; // live user turn
+        const cap = autonomousCallCapPerHour();
+        if (cap <= 0) return; // breaker disabled
+        const count = autonomousCallsInLastHour();
+        if (count >= cap) {
+          log.error(
+            { callSite, count, cap },
+            "[AUTONOMOUS CIRCUIT BREAKER] hourly autonomous-turn LLM call cap reached; rejecting autonomous call. Live user turns are unaffected. Tune via AUTONOMOUS_MAX_CALLS_PER_HOUR (0 disables).",
+          );
+          tripped = new RateLimitError(
+            `Autonomous LLM circuit open: ${count} autonomous mainAgent calls in the last hour (cap ${cap}). Scheduled/watcher/wake work paused; live user turns unaffected.`,
+          );
+        } else {
+          recordAutonomousCall();
+        }
       } else {
-        recordBackgroundCall();
+        const cap = backgroundCallCapPerHour();
+        if (cap <= 0) return; // breaker disabled
+        const count = backgroundCallsInLastHour();
+        if (count >= cap) {
+          log.error(
+            { callSite, count, cap },
+            "[BACKGROUND CIRCUIT BREAKER] hourly background LLM call cap reached; rejecting background call. User-facing calls are unaffected. Tune via BACKGROUND_MAX_CALLS_PER_HOUR (0 disables).",
+          );
+          tripped = new RateLimitError(
+            `Background LLM circuit open: ${count} background calls in the last hour (cap ${cap}). Background work paused; user-facing calls unaffected.`,
+          );
+        } else {
+          recordBackgroundCall();
+        }
       }
     } catch (err) {
       // Fail OPEN — the breaker must never itself break the assistant.
-      log.warn({ err }, "background circuit breaker internal error; failing open");
+      log.warn({ err }, "circuit breaker internal error; failing open");
       return;
     }
     if (tripped) throw tripped;

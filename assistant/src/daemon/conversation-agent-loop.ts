@@ -335,6 +335,15 @@ export async function runAgentLoopImpl(
   // injection assembly self-resolves it for the turn's plugin contexts.
   ctx.currentCallSite = turnCallSite;
 
+  // Turn origin for the autonomous circuit breaker: a turn is autonomous when
+  // its conversation was created by the machine (source `schedule`, `watcher`,
+  // wake, heartbeat, ...) rather than by a human (`user`). Conversations
+  // without a source predate the column and are all user chats, so they count
+  // as interactive. Deliberately NOT `isInteractive` — that flag means "a live
+  // client is attached", and REST/app turns run with it false.
+  const turnOrigin: "interactive" | "autonomous" =
+    ctx.source && ctx.source !== "user" ? "autonomous" : "interactive";
+
   // Optional per-turn inference-profile override. Plumbed through to every
   // LLM call the loop emits and inherited by any subagents spawned during
   // this turn. Caller-supplied `options.overrideProfile` (e.g.
@@ -972,6 +981,7 @@ export async function runAgentLoopImpl(
           requestId: reqId,
           onCheckpoint,
           callSite: turnCallSite,
+          turnOrigin,
           trust: loopTrust,
           overrideProfile: turnOverrideProfile,
           ...(forceOverrideProfile ? { forceOverrideProfile: true } : {}),

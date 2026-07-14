@@ -513,6 +513,14 @@ export interface AgentLoopRunOptions {
   ) => CheckpointDecision | Promise<CheckpointDecision>;
   callSite?: LLMCallSite;
   /**
+   * Whether this turn was initiated by a human (`"interactive"`) or by the
+   * machine (`"autonomous"`: schedule, watcher, wake, ...). Threaded onto
+   * every provider call's `SendMessageConfig.turnOrigin` so the autonomous
+   * circuit breaker in `RateLimitProvider` can bound machine-initiated
+   * `mainAgent` turns without ever gating live user turns.
+   */
+  turnOrigin?: "interactive" | "autonomous";
+  /**
    * Trust classification and channel identity for the turn's inbound actor,
    * supplied by the caller as the turn-start snapshot. Read only on the
    * mid-loop in-place compaction path — to scope the compactor's image
@@ -904,6 +912,7 @@ export class AgentLoop {
       requestId,
       onCheckpoint,
       callSite,
+      turnOrigin,
       trust,
       overrideProfile,
       forceOverrideProfile = false,
@@ -1317,6 +1326,14 @@ export class AgentLoop {
           if (this.conversationId) {
             providerConfig.selectionSeed = this.conversationId;
           }
+        }
+
+        // Turn origin (interactive vs autonomous), consumed by the autonomous
+        // circuit breaker in `RateLimitProvider`. Threaded on every send so
+        // each provider call an autonomous turn issues counts against the
+        // hourly window.
+        if (turnOrigin) {
+          providerConfig.turnOrigin = turnOrigin;
         }
 
         // Per-call inference-profile override. The resolver layers

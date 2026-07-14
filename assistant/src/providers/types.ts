@@ -174,6 +174,16 @@ export interface SendMessageConfig {
    */
   callSite?: LLMCallSite;
   /**
+   * Whether the turn issuing this call was initiated by a human
+   * (`"interactive"`: conversation source `user` — chat, voice, val_query) or
+   * by the machine (`"autonomous"`: schedule, watcher, wake, and every other
+   * non-user conversation source). Set by the daemon agent-loop wrapper for
+   * `mainAgent` turns; consumed by the autonomous circuit breaker in
+   * `RateLimitProvider` so a schedule/watcher/wake storm is bounded per hour
+   * while live user turns are never gated.
+   */
+  turnOrigin?: "interactive" | "autonomous";
+  /**
    * Optional ad-hoc profile override applied per request. When set, the
    * resolver layers `llm.profiles[overrideProfile]` between the workspace's
    * `activeProfile` and the call-site's named profile (see

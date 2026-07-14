@@ -150,14 +150,14 @@ export async function getOrCreateConversation(
       // Per-call `callSite` routing layered on top, with connection-awareness
       // for alternate profiles (matches the canonical dispatch path).
       let provider = wrapWithCallSiteRouting(baseProvider, config);
-      const { rateLimit } = config;
-      if (rateLimit.maxRequestsPerMinute > 0) {
-        provider = new RateLimitProvider(
-          provider,
-          rateLimit,
-          _sharedRequestTimestamps,
-        );
-      }
+      // Always wrap: RateLimitProvider also hosts the global circuit breakers
+      // (background + autonomous), which must exist even when the per-minute
+      // request limit is disabled (enforceRequestRate no-ops at <= 0).
+      provider = new RateLimitProvider(
+        provider,
+        config.rateLimit,
+        _sharedRequestTimestamps,
+      );
       const workingDir = getSandboxWorkingDir();
 
       const systemPrompt =
