@@ -206,14 +206,14 @@ export class SubagentManager {
     // threads `appConfig` through so per-call alternate-profile routing is
     // also connection-aware (matches the canonical dispatch path).
     let provider = wrapWithCallSiteRouting(baseProvider, appConfig);
-    const { rateLimit } = appConfig;
-    if (rateLimit.maxRequestsPerMinute > 0) {
-      provider = new RateLimitProvider(
-        provider,
-        rateLimit,
-        this.sharedRequestTimestamps,
-      );
-    }
+    // Always wrap: RateLimitProvider also hosts the global circuit breakers
+    // (background + autonomous), which must exist even when the per-minute
+    // request limit is disabled (enforceRequestRate no-ops at <= 0).
+    provider = new RateLimitProvider(
+      provider,
+      appConfig.rateLimit,
+      this.sharedRequestTimestamps,
+    );
 
     const parentConversation = findConversation(config.parentConversationId);
 
