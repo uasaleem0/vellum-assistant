@@ -1,5 +1,6 @@
 import type { RateLimitConfig } from "../config/types.js";
 import { RateLimitError } from "../util/errors.js";
+import { getLogger } from "../util/logger.js";
 import {
   autonomousCallCapPerHour,
   autonomousCallsInLastHour,
@@ -8,7 +9,6 @@ import {
   recordAutonomousCall,
   recordBackgroundCall,
 } from "./background-rate-limit.js";
-import { getLogger } from "../util/logger.js";
 import type {
   Message,
   Provider,

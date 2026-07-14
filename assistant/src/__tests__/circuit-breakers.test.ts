@@ -88,7 +88,10 @@ describe("RateLimitProvider circuit breakers", () => {
       const provider = new RateLimitProvider(makeProvider(), config);
 
       await provider.sendMessage(messages, backgroundCall("memoryRouter"));
-      await provider.sendMessage(messages, backgroundCall("analyzeConversation"));
+      await provider.sendMessage(
+        messages,
+        backgroundCall("analyzeConversation"),
+      );
       await expect(
         provider.sendMessage(messages, backgroundCall("heartbeatAgent")),
       ).rejects.toThrow(RateLimitError);
