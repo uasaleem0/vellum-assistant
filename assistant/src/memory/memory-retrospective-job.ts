@@ -56,10 +56,6 @@ import type { SystemPromptPersonaOverride } from "../prompts/system-prompt.js";
 import { wakeAgentForOpportunity } from "../runtime/agent-wake.js";
 import { getLogger } from "../util/logger.js";
 import {
-  recordRetrospectiveRun,
-  retrospectiveRunsInLastHour,
-} from "./memory-retrospective-rate-limit.js";
-import {
   addMessage,
   type ConversationRow,
   deleteConversation,
@@ -82,6 +78,10 @@ import {
   MEMORY_RETROSPECTIVE_SOURCE,
 } from "./memory-retrospective-constants.js";
 import { loadRetrospectiveRunMessages } from "./memory-retrospective-fork-boundary.js";
+import {
+  recordRetrospectiveRun,
+  retrospectiveRunsInLastHour,
+} from "./memory-retrospective-rate-limit.js";
 import {
   appendToRememberedLog,
   bumpRetrospectiveLastRunAt,
