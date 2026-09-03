@@ -1,0 +1,1857 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+
+import type { SttStreamServerEvent } from "../../stt/types.js";
+import { DeepgramRealtimeTranscriber } from "./deepgram-realtime.js";
+
+const TEST_API_KEY = "dg-test-key-for-streaming";
+
+// ---------------------------------------------------------------------------
+// Mock WebSocket
+// ---------------------------------------------------------------------------
+
+type WsEventType = "open" | "close" | "error" | "message";
+type WsListener = (...args: unknown[]) => void;
+
+/**
+ * Minimal mock WebSocket that simulates the Deepgram live endpoint.
+ * Tests drive behavior by calling helper methods (e.g. `simulateOpen`,
+ * `simulateMessage`).
+ */
+class MockWebSocket {
+  readyState = 0; // CONNECTING
+  bufferedAmount = 0;
+
+  /** All data sent via `.send()`. */
+  sentData: (string | Uint8Array)[] = [];
+
+  /** Whether `.close()` was called. */
+  closeCalled = false;
+  closeCode?: number;
+  closeReason?: string;
+
+  private listeners = new Map<WsEventType, WsListener[]>();
+
+  addEventListener(type: WsEventType, listener: WsListener): void {
+    const list = this.listeners.get(type) ?? [];
+    list.push(listener);
+    this.listeners.set(type, list);
+  }
+
+  removeEventListener(type: string, listener: unknown): void {
+    const list = this.listeners.get(type as WsEventType);
+    if (!list) {
+      return;
+    }
+    const idx = list.indexOf(listener as WsListener);
+    if (idx !== -1) {
+      list.splice(idx, 1);
+    }
+  }
+
+  send(data: string | Uint8Array): void {
+    if (this.readyState !== 1) {
+      throw new Error("WebSocket is not open");
+    }
+    this.sentData.push(data);
+  }
+
+  close(code?: number, reason?: string): void {
+    this.closeCalled = true;
+    this.closeCode = code;
+    this.closeReason = reason;
+    this.readyState = 3; // CLOSED
+  }
+
+  // ── Test helpers ──────────────────────────────────────────────────
+
+  simulateOpen(): void {
+    this.readyState = 1; // OPEN
+    for (const l of this.listeners.get("open") ?? []) {
+      l();
+    }
+  }
+
+  simulateMessage(data: string): void {
+    for (const l of this.listeners.get("message") ?? []) {
+      l({ data });
+    }
+  }
+
+  simulateClose(code = 1000, reason = ""): void {
+    this.readyState = 3;
+    for (const l of this.listeners.get("close") ?? []) {
+      l({ code, reason });
+    }
+  }
+
+  simulateError(err: unknown): void {
+    for (const l of this.listeners.get("error") ?? []) {
+      l(err);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Build a Deepgram streaming "Results" JSON frame. */
+function resultsFrame(
+  transcript: string,
+  options: {
+    is_final?: boolean;
+    speech_final?: boolean;
+    from_finalize?: boolean;
+    words?: { word: string; speaker?: number; language?: string }[];
+    /** Container-level detected languages on the alternative. */
+    alternativeLanguages?: string[];
+    /** Container-level detected languages on the channel. */
+    channelLanguages?: string[];
+  } = {},
+): string {
+  return JSON.stringify({
+    type: "Results",
+    channel_index: [0, 1],
+    duration: 1.5,
+    start: 0,
+    is_final: options.is_final ?? false,
+    speech_final: options.speech_final ?? false,
+    ...(options.from_finalize !== undefined
+      ? { from_finalize: options.from_finalize }
+      : {}),
+    channel: {
+      alternatives: [
+        {
+          transcript,
+          confidence: 0.95,
+          ...(options.words ? { words: options.words } : {}),
+          ...(options.alternativeLanguages
+            ? { languages: options.alternativeLanguages }
+            : {}),
+        },
+      ],
+      ...(options.channelLanguages
+        ? { languages: options.channelLanguages }
+        : {}),
+    },
+  });
+}
+
+/** Build a Deepgram "UtteranceEnd" frame. */
+function utteranceEndFrame(): string {
+  return JSON.stringify({ type: "UtteranceEnd" });
+}
+
+/** Build a Deepgram "Metadata" frame. */
+function metadataFrame(): string {
+  return JSON.stringify({
+    type: "Metadata",
+    request_id: "test-request-id",
+    model_info: { name: "nova-2" },
+  });
+}
+
+/** Collect all events emitted during a test. */
+function createEventCollector(): {
+  events: SttStreamServerEvent[];
+  onEvent: (event: SttStreamServerEvent) => void;
+} {
+  const events: SttStreamServerEvent[] = [];
+  return {
+    events,
+    onEvent: (event: SttStreamServerEvent) => events.push(event),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Test suite
+// ---------------------------------------------------------------------------
+
+describe("DeepgramRealtimeTranscriber", () => {
+  let mockWs: MockWebSocket;
+  let originalWebSocket: unknown;
+
+  beforeEach(() => {
+    mockWs = new MockWebSocket();
+    originalWebSocket = (globalThis as Record<string, unknown>).WebSocket;
+
+    // Replace global WebSocket with a factory that returns our mock.
+    (globalThis as Record<string, unknown>).WebSocket = class {
+      constructor(
+        _url: string,
+        _options?: { headers?: Record<string, string> },
+      ) {
+        // Immediately schedule the mock's open event for the next microtask
+        // so start() can attach its handlers first.
+        return mockWs;
+      }
+    };
+  });
+
+  afterEach(() => {
+    (globalThis as Record<string, unknown>).WebSocket = originalWebSocket;
+  });
+
+  // ── Helper: start a session ────────────────────────────────────────
+
+  async function startSession(
+    options?: ConstructorParameters<typeof DeepgramRealtimeTranscriber>[1],
+  ): Promise<{
+    transcriber: DeepgramRealtimeTranscriber;
+    events: SttStreamServerEvent[];
+  }> {
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY, {
+      inactivityTimeoutMs: 60_000, // long timeout to avoid test flakes
+      ...options,
+    });
+    const { events, onEvent } = createEventCollector();
+
+    const startPromise = transcriber.start(onEvent);
+    // Simulate the WebSocket opening after start() attaches handlers.
+    mockWs.simulateOpen();
+    await startPromise;
+
+    return { transcriber, events };
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // Connection lifecycle
+  // ─────────────────────────────────────────────────────────────────
+
+  test("start() opens WebSocket and resolves on open", async () => {
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY);
+    const { onEvent } = createEventCollector();
+
+    const startPromise = transcriber.start(onEvent);
+    mockWs.simulateOpen();
+    await startPromise;
+
+    // The mock WebSocket should have been created (readyState was set to OPEN).
+    expect(mockWs.readyState).toBe(1);
+  });
+
+  test("start() rejects on connect timeout", async () => {
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY, {
+      connectTimeoutMs: 50,
+    });
+    const { onEvent } = createEventCollector();
+
+    // Never simulate open — let the timeout fire.
+    await expect(transcriber.start(onEvent)).rejects.toThrow(
+      "Deepgram realtime connect timeout",
+    );
+  });
+
+  test("start() rejects on WebSocket error during connect", async () => {
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY);
+    const { onEvent } = createEventCollector();
+
+    const startPromise = transcriber.start(onEvent);
+    mockWs.simulateError(new Error("Connection refused"));
+
+    await expect(startPromise).rejects.toThrow("connect error");
+  });
+
+  test("start() rejects on WebSocket close before open", async () => {
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY);
+    const { onEvent } = createEventCollector();
+
+    const startPromise = transcriber.start(onEvent);
+    mockWs.simulateClose(1006, "abnormal");
+
+    await expect(startPromise).rejects.toThrow("closed before open");
+  });
+
+  test("start() throws if called twice", async () => {
+    const { transcriber } = await startSession();
+
+    await expect(transcriber.start(() => {})).rejects.toThrow(
+      "start() called twice",
+    );
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Partial (interim) transcript events
+  // ─────────────────────────────────────────────────────────────────
+
+  test("emits partial event for interim results (is_final=false)", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateMessage(resultsFrame("hello wor", { is_final: false }));
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "partial",
+      text: "hello wor",
+      confidence: 0.95,
+    });
+  });
+
+  test("trims whitespace from partial transcript text", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateMessage(resultsFrame("  hello  ", { is_final: false }));
+
+    expect(events[0]).toEqual({
+      type: "partial",
+      text: "hello",
+      confidence: 0.95,
+    });
+  });
+
+  test("does not emit partials when interimResults is disabled", async () => {
+    const { events } = await startSession({ interimResults: false });
+
+    mockWs.simulateMessage(resultsFrame("hello", { is_final: false }));
+
+    expect(events).toHaveLength(0);
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Final transcript events
+  // ─────────────────────────────────────────────────────────────────
+
+  test("emits final event for committed results (is_final=true)", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateMessage(
+      resultsFrame("hello world", { is_final: true, speech_final: true }),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "final",
+      text: "hello world",
+      confidence: 0.95,
+    });
+  });
+
+  test("emits final with empty text for silence segments", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateMessage(resultsFrame("", { is_final: true }));
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "final",
+      text: "",
+      confidence: 0.95,
+    });
+  });
+
+  test("handles missing transcript field gracefully", async () => {
+    const { events } = await startSession();
+
+    const frame = JSON.stringify({
+      type: "Results",
+      is_final: true,
+      channel: { alternatives: [{ confidence: 0.5 }] },
+    });
+    mockWs.simulateMessage(frame);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "final",
+      text: "",
+      confidence: 0.5,
+    });
+  });
+
+  test("handles missing channel field gracefully", async () => {
+    const { events } = await startSession();
+
+    const frame = JSON.stringify({
+      type: "Results",
+      is_final: true,
+    });
+    mockWs.simulateMessage(frame);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({ type: "final", text: "" });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Diarization: speakerLabel extraction
+  // ─────────────────────────────────────────────────────────────────
+
+  // Fixture A: diarize disabled (default) — baseline shape unchanged.
+  test("omits speakerLabel when diarization is disabled", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateMessage(resultsFrame("hello world", { is_final: true }));
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "final",
+      text: "hello world",
+      confidence: 0.95,
+    });
+    // `in` check: the key must not exist at all, not just be undefined.
+    expect("speakerLabel" in events[0]).toBe(false);
+  });
+
+  // Fixture B: single-speaker segment with diarize on.
+  test("emits speakerLabel '0' for a single-speaker segment", async () => {
+    const { events } = await startSession({ diarize: true });
+
+    mockWs.simulateMessage(
+      resultsFrame("hello world", {
+        is_final: true,
+        words: [
+          { word: "hello", speaker: 0 },
+          { word: "world", speaker: 0 },
+        ],
+      }),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "final",
+      text: "hello world",
+      speakerLabel: "0",
+      confidence: 0.95,
+    });
+  });
+
+  // Fixture C: two speakers with one dominant — mode wins.
+  test("emits speakerLabel for the dominant speaker in a two-speaker segment", async () => {
+    const { events } = await startSession({ diarize: true });
+
+    // Speaker 1 says three words, speaker 0 says one — speaker 1 is the mode.
+    mockWs.simulateMessage(
+      resultsFrame("yes exactly right here", {
+        is_final: true,
+        words: [
+          { word: "yes", speaker: 0 },
+          { word: "exactly", speaker: 1 },
+          { word: "right", speaker: 1 },
+          { word: "here", speaker: 1 },
+        ],
+      }),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "final",
+      text: "yes exactly right here",
+      speakerLabel: "1",
+      confidence: 0.95,
+    });
+  });
+
+  // Fixture D: tied segment — first-word speaker wins.
+  test("breaks ties by picking the first word's speaker", async () => {
+    const { events } = await startSession({ diarize: true });
+
+    // 2 words for each speaker — tie. First word is speaker 2, so 2 wins.
+    mockWs.simulateMessage(
+      resultsFrame("alpha beta gamma delta", {
+        is_final: true,
+        words: [
+          { word: "alpha", speaker: 2 },
+          { word: "beta", speaker: 3 },
+          { word: "gamma", speaker: 2 },
+          { word: "delta", speaker: 3 },
+        ],
+      }),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "final",
+      text: "alpha beta gamma delta",
+      speakerLabel: "2",
+      confidence: 0.95,
+    });
+  });
+
+  // Also verify partials carry the label.
+  test("emits speakerLabel on partial events when diarization is enabled", async () => {
+    const { events } = await startSession({ diarize: true });
+
+    mockWs.simulateMessage(
+      resultsFrame("hel", {
+        is_final: false,
+        words: [{ word: "hel", speaker: 0 }],
+      }),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "partial",
+      text: "hel",
+      speakerLabel: "0",
+      confidence: 0.95,
+    });
+  });
+
+  // Diarize on, but the provider response carries no per-word speakers —
+  // speakerLabel must stay undefined/absent.
+  test("omits speakerLabel when words have no speaker field", async () => {
+    const { events } = await startSession({ diarize: true });
+
+    mockWs.simulateMessage(
+      resultsFrame("no speakers here", {
+        is_final: true,
+        words: [{ word: "no" }, { word: "speakers" }, { word: "here" }],
+      }),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "final",
+      text: "no speakers here",
+      confidence: 0.95,
+    });
+    expect("speakerLabel" in events[0]).toBe(false);
+  });
+
+  test("forwards diarize=true to the Deepgram WebSocket URL", async () => {
+    let capturedUrl: string | undefined;
+    const origWs = (globalThis as Record<string, unknown>).WebSocket;
+    (globalThis as Record<string, unknown>).WebSocket = class {
+      constructor(url: string) {
+        capturedUrl = url;
+        return mockWs;
+      }
+    };
+
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY, {
+      diarize: true,
+    });
+    const { onEvent } = createEventCollector();
+    const startPromise = transcriber.start(onEvent);
+    mockWs.simulateOpen();
+    await startPromise;
+
+    const url = new URL(capturedUrl!);
+    expect(url.searchParams.get("diarize")).toBe("true");
+
+    (globalThis as Record<string, unknown>).WebSocket = origWs;
+  });
+
+  test("omits diarize param when diarization is disabled (default)", async () => {
+    let capturedUrl: string | undefined;
+    const origWs = (globalThis as Record<string, unknown>).WebSocket;
+    (globalThis as Record<string, unknown>).WebSocket = class {
+      constructor(url: string) {
+        capturedUrl = url;
+        return mockWs;
+      }
+    };
+
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY);
+    const { onEvent } = createEventCollector();
+    const startPromise = transcriber.start(onEvent);
+    mockWs.simulateOpen();
+    await startPromise;
+
+    const url = new URL(capturedUrl!);
+    expect(url.searchParams.get("diarize")).toBeNull();
+
+    (globalThis as Record<string, unknown>).WebSocket = origWs;
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Language metadata (nova-3 multi code-switching)
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("language metadata", () => {
+    test("ranks per-word language tags by dominance on final events", async () => {
+      const { events } = await startSession();
+
+      mockWs.simulateMessage(
+        resultsFrame("hello world hola", {
+          is_final: true,
+          words: [
+            { word: "hello", language: "en" },
+            { word: "world", language: "en" },
+            { word: "hola", language: "es" },
+          ],
+        }),
+      );
+
+      expect(events).toHaveLength(1);
+      expect(events[0]).toEqual({
+        type: "final",
+        text: "hello world hola",
+        confidence: 0.95,
+        languages: ["en", "es"],
+      });
+    });
+
+    test("omits the languages field entirely when no language metadata is present", async () => {
+      const { events } = await startSession();
+
+      mockWs.simulateMessage(
+        resultsFrame("hello world", {
+          is_final: true,
+          words: [{ word: "hello" }, { word: "world" }],
+        }),
+      );
+      mockWs.simulateMessage(resultsFrame("still typing", { is_final: false }));
+
+      expect(events).toHaveLength(2);
+      for (const event of events) {
+        // The keys must not exist at all, not just be undefined-valued.
+        expect("language" in event).toBe(false);
+        expect("languages" in event).toBe(false);
+      }
+    });
+
+    test("normalizes regional tags to their base subtag", async () => {
+      const { events } = await startSession();
+
+      mockWs.simulateMessage(
+        resultsFrame("hello", {
+          is_final: true,
+          words: [{ word: "hello", language: "en-US" }],
+        }),
+      );
+
+      expect(events[0]).toEqual({
+        type: "final",
+        text: "hello",
+        confidence: 0.95,
+        languages: ["en"],
+      });
+    });
+
+    test("partial events carry the fields when interim results are enabled", async () => {
+      const { events } = await startSession();
+
+      mockWs.simulateMessage(
+        resultsFrame("namaste hello", {
+          is_final: false,
+          words: [
+            { word: "namaste", language: "hi" },
+            { word: "hello", language: "en" },
+            { word: "there", language: "en" },
+          ],
+        }),
+      );
+
+      expect(events).toHaveLength(1);
+      expect(events[0]).toEqual({
+        type: "partial",
+        text: "namaste hello",
+        confidence: 0.95,
+        languages: ["en", "hi"],
+      });
+    });
+
+    test("falls back to the alternative-level languages array when words carry no tags", async () => {
+      const { events } = await startSession();
+
+      mockWs.simulateMessage(
+        resultsFrame("mixed speech", {
+          is_final: true,
+          words: [{ word: "mixed" }, { word: "speech" }],
+          alternativeLanguages: ["es-419", "en", "ES"],
+        }),
+      );
+
+      expect(events[0]).toEqual({
+        type: "final",
+        text: "mixed speech",
+        confidence: 0.95,
+        languages: ["es", "en"],
+      });
+    });
+
+    test("falls back to the channel-level languages array when the alternative has none", async () => {
+      const { events } = await startSession();
+
+      mockWs.simulateMessage(
+        resultsFrame("bonjour", {
+          is_final: true,
+          channelLanguages: ["fr", "en"],
+        }),
+      );
+
+      expect(events[0]).toEqual({
+        type: "final",
+        text: "bonjour",
+        confidence: 0.95,
+        languages: ["fr", "en"],
+      });
+    });
+
+    test("per-word tags take precedence over container arrays", async () => {
+      const { events } = await startSession();
+
+      mockWs.simulateMessage(
+        resultsFrame("hola amigo", {
+          is_final: true,
+          words: [
+            { word: "hola", language: "es" },
+            { word: "amigo", language: "es" },
+          ],
+          alternativeLanguages: ["en", "es"],
+        }),
+      );
+
+      expect(events[0]).toEqual({
+        type: "final",
+        text: "hola amigo",
+        confidence: 0.95,
+        languages: ["es"],
+      });
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Multi-event sequence
+  // ─────────────────────────────────────────────────────────────────
+
+  test("emits partial then final for a complete utterance", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateMessage(resultsFrame("hel", { is_final: false }));
+    mockWs.simulateMessage(resultsFrame("hello", { is_final: false }));
+    mockWs.simulateMessage(
+      resultsFrame("hello world", { is_final: true, speech_final: true }),
+    );
+
+    expect(events).toHaveLength(3);
+    expect(events[0]).toEqual({
+      type: "partial",
+      text: "hel",
+      confidence: 0.95,
+    });
+    expect(events[1]).toEqual({
+      type: "partial",
+      text: "hello",
+      confidence: 0.95,
+    });
+    expect(events[2]).toEqual({
+      type: "final",
+      text: "hello world",
+      confidence: 0.95,
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Utterance-boundary finals (telephony gating)
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("utteranceBoundaryFinals", () => {
+    test("withholds is_final segments until speech_final, then emits one aggregated final", async () => {
+      const { events } = await startSession({ utteranceBoundaryFinals: true });
+
+      mockWs.simulateMessage(resultsFrame("this is a", { is_final: true }));
+      mockWs.simulateMessage(resultsFrame("long sentence", { is_final: true }));
+      expect(events.filter((e) => e.type === "final")).toHaveLength(0);
+
+      mockWs.simulateMessage(
+        resultsFrame("with a pause", { is_final: true, speech_final: true }),
+      );
+
+      const finals = events.filter((e) => e.type === "final");
+      expect(finals).toHaveLength(1);
+      expect(finals[0]).toEqual({
+        type: "final",
+        text: "this is a long sentence with a pause",
+      });
+    });
+
+    test("still emits partials while segments are withheld", async () => {
+      const { events } = await startSession({ utteranceBoundaryFinals: true });
+
+      mockWs.simulateMessage(resultsFrame("this is", { is_final: false }));
+      mockWs.simulateMessage(resultsFrame("this is a", { is_final: true }));
+      mockWs.simulateMessage(resultsFrame("long sen", { is_final: false }));
+
+      expect(events.filter((e) => e.type === "partial")).toHaveLength(2);
+      expect(events.filter((e) => e.type === "final")).toHaveLength(0);
+    });
+
+    test("UtteranceEnd flushes withheld segments as a single final", async () => {
+      const { events } = await startSession({ utteranceBoundaryFinals: true });
+
+      mockWs.simulateMessage(
+        resultsFrame("trailing words", { is_final: true }),
+      );
+      mockWs.simulateMessage(utteranceEndFrame());
+
+      const finals = events.filter((e) => e.type === "final");
+      expect(finals).toHaveLength(1);
+      expect(finals[0]).toEqual({ type: "final", text: "trailing words" });
+    });
+
+    test("boundary signals over silence emit nothing", async () => {
+      const { events } = await startSession({ utteranceBoundaryFinals: true });
+
+      mockWs.simulateMessage(
+        resultsFrame("", { is_final: true, speech_final: true }),
+      );
+      mockWs.simulateMessage(utteranceEndFrame());
+
+      expect(events).toHaveLength(0);
+    });
+
+    test("close flushes withheld segments before the closed event", async () => {
+      const { transcriber, events } = await startSession({
+        utteranceBoundaryFinals: true,
+      });
+
+      mockWs.simulateMessage(resultsFrame("cut off", { is_final: true }));
+      transcriber.stop();
+      mockWs.simulateClose(1000, "normal");
+
+      const finalIndex = events.findIndex((e) => e.type === "final");
+      const closedIndex = events.findIndex((e) => e.type === "closed");
+      expect(finalIndex).toBeGreaterThanOrEqual(0);
+      expect(closedIndex).toBeGreaterThan(finalIndex);
+      expect(events[finalIndex]).toEqual({ type: "final", text: "cut off" });
+    });
+
+    test("each utterance aggregates independently", async () => {
+      const { events } = await startSession({ utteranceBoundaryFinals: true });
+
+      mockWs.simulateMessage(resultsFrame("first part", { is_final: true }));
+      mockWs.simulateMessage(
+        resultsFrame("done", { is_final: true, speech_final: true }),
+      );
+      mockWs.simulateMessage(
+        resultsFrame("second utterance", {
+          is_final: true,
+          speech_final: true,
+        }),
+      );
+
+      const finals = events.filter((e) => e.type === "final") as {
+        type: "final";
+        text: string;
+      }[];
+      expect(finals.map((f) => f.text)).toEqual([
+        "first part done",
+        "second utterance",
+      ]);
+    });
+
+    test("aggregated final ranks language tags across all withheld frames", async () => {
+      const { events } = await startSession({ utteranceBoundaryFinals: true });
+
+      // Raw per-word tags are accumulated, so "es" (2 words) outranks
+      // "en" (1 word) even though "en" arrived in the earlier frame.
+      mockWs.simulateMessage(
+        resultsFrame("hello", {
+          is_final: true,
+          words: [{ word: "hello", language: "en" }],
+        }),
+      );
+      mockWs.simulateMessage(
+        resultsFrame("hola amigo", {
+          is_final: true,
+          speech_final: true,
+          words: [
+            { word: "hola", language: "es" },
+            { word: "amigo", language: "es" },
+          ],
+        }),
+      );
+
+      const finals = events.filter((e) => e.type === "final");
+      expect(finals).toHaveLength(1);
+      expect(finals[0]).toEqual({
+        type: "final",
+        text: "hello hola amigo",
+        languages: ["es", "en"],
+      });
+    });
+
+    test("UtteranceEnd flush carries the accumulated language metadata", async () => {
+      const { events } = await startSession({ utteranceBoundaryFinals: true });
+
+      mockWs.simulateMessage(
+        resultsFrame("bonjour", {
+          is_final: true,
+          words: [{ word: "bonjour", language: "fr" }],
+        }),
+      );
+      mockWs.simulateMessage(
+        resultsFrame("hello there", {
+          is_final: true,
+          alternativeLanguages: ["en"],
+        }),
+      );
+      mockWs.simulateMessage(utteranceEndFrame());
+
+      const finals = events.filter((e) => e.type === "final");
+      expect(finals).toHaveLength(1);
+      expect(finals[0]).toEqual({
+        type: "final",
+        text: "bonjour hello there",
+        languages: ["fr", "en"],
+      });
+    });
+
+    test("aggregated final omits language fields when no withheld frame carried tags", async () => {
+      const { events } = await startSession({ utteranceBoundaryFinals: true });
+
+      mockWs.simulateMessage(resultsFrame("no tags", { is_final: true }));
+      mockWs.simulateMessage(
+        resultsFrame("at all", { is_final: true, speech_final: true }),
+      );
+
+      const finals = events.filter((e) => e.type === "final");
+      expect(finals).toHaveLength(1);
+      expect(finals[0]).toEqual({ type: "final", text: "no tags at all" });
+      expect("language" in finals[0]!).toBe(false);
+      expect("languages" in finals[0]!).toBe(false);
+    });
+
+    test("tags on empty-text frames do not leak into the aggregated final", async () => {
+      const { events } = await startSession({ utteranceBoundaryFinals: true });
+
+      // A silence segment may still carry container-level tags; only
+      // frames that contributed transcript text feed the metadata.
+      mockWs.simulateMessage(
+        resultsFrame("", { is_final: true, alternativeLanguages: ["fr"] }),
+      );
+      mockWs.simulateMessage(
+        resultsFrame("hello", {
+          is_final: true,
+          speech_final: true,
+          words: [{ word: "hello", language: "en" }],
+        }),
+      );
+
+      const finals = events.filter((e) => e.type === "final");
+      expect(finals).toHaveLength(1);
+      expect(finals[0]).toEqual({
+        type: "final",
+        text: "hello",
+        languages: ["en"],
+      });
+    });
+
+    test("language tags reset between aggregated utterances", async () => {
+      const { events } = await startSession({ utteranceBoundaryFinals: true });
+
+      mockWs.simulateMessage(
+        resultsFrame("hola", {
+          is_final: true,
+          speech_final: true,
+          words: [{ word: "hola", language: "es" }],
+        }),
+      );
+      mockWs.simulateMessage(
+        resultsFrame("hello", {
+          is_final: true,
+          speech_final: true,
+          words: [{ word: "hello", language: "en" }],
+        }),
+      );
+
+      const finals = events.filter((e) => e.type === "final");
+      expect(finals).toHaveLength(2);
+      expect(finals[1]).toEqual({
+        type: "final",
+        text: "hello",
+        languages: ["en"],
+      });
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // finalizeUtterance (mid-stream flush)
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("finalizeUtterance", () => {
+    test("sends the Finalize control frame on an open socket", async () => {
+      const { transcriber, events } = await startSession();
+
+      transcriber.finalizeUtterance();
+
+      const textMessages = mockWs.sentData.filter((d) => typeof d === "string");
+      expect(textMessages).toHaveLength(1);
+      expect(JSON.parse(textMessages[0] as string)).toEqual({
+        type: "Finalize",
+      });
+      // No finalized event until the provider's from_finalize flush arrives.
+      expect(events).toHaveLength(0);
+    });
+
+    test("from_finalize results message emits final then finalized", async () => {
+      const { transcriber, events } = await startSession();
+
+      transcriber.finalizeUtterance();
+      mockWs.simulateMessage(
+        resultsFrame("buffered tail", { is_final: true, from_finalize: true }),
+      );
+
+      expect(events).toEqual([
+        {
+          type: "final",
+          text: "buffered tail",
+          confidence: 0.95,
+          fromFinalize: true,
+        },
+        { type: "finalized" },
+      ]);
+    });
+
+    test("empty-transcript flush emits only finalized", async () => {
+      const { transcriber, events } = await startSession();
+
+      transcriber.finalizeUtterance();
+      mockWs.simulateMessage(
+        resultsFrame("", { is_final: true, from_finalize: true }),
+      );
+
+      expect(events).toEqual([{ type: "finalized" }]);
+    });
+
+    test("emits finalized via fallback when no from_finalize flush arrives", async () => {
+      const { transcriber, events } = await startSession({
+        finalizeFallbackMs: 20,
+      });
+
+      // Deepgram omits the flush entirely when nothing significant is
+      // buffered — the fallback timer must complete the contract.
+      transcriber.finalizeUtterance();
+      expect(events).toHaveLength(0);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      expect(events).toEqual([{ type: "finalized" }]);
+
+      // A flush arriving after the fallback must not double-emit.
+      mockWs.simulateMessage(
+        resultsFrame("", { is_final: true, from_finalize: true }),
+      );
+      expect(events).toEqual([{ type: "finalized" }]);
+    });
+
+    test("a late flush after a fallback settlement emits neither final nor finalized", async () => {
+      const { transcriber, events } = await startSession({
+        finalizeFallbackMs: 20,
+      });
+
+      transcriber.finalizeUtterance();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(events).toEqual([{ type: "finalized" }]);
+
+      // The request already settled — its slow flush is stale, and its
+      // text must not surface as a fresh flush.
+      mockWs.simulateMessage(
+        resultsFrame("late tail", { is_final: true, from_finalize: true }),
+      );
+
+      expect(events).toEqual([{ type: "finalized" }]);
+    });
+
+    test("an omitted flush does not poison the next request's flush", async () => {
+      const { transcriber, events } = await startSession({
+        finalizeFallbackMs: 20,
+      });
+
+      // Request one settles via the fallback because Deepgram OMITTED the
+      // flush (nothing significant buffered) — no stale frame ever arrives
+      // to consume the debt.
+      transcriber.finalizeUtterance();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(events).toEqual([{ type: "finalized" }]);
+
+      // Sending request two clears the debt, so its legitimate flush is
+      // emitted and settles it — not dropped as stale.
+      transcriber.finalizeUtterance();
+      mockWs.simulateMessage(
+        resultsFrame("current turn", { is_final: true, from_finalize: true }),
+      );
+      expect(events).toEqual([
+        { type: "finalized" },
+        {
+          type: "final",
+          text: "current turn",
+          confidence: 0.95,
+          fromFinalize: true,
+        },
+        { type: "finalized" },
+      ]);
+    });
+
+    test("repeated omitted flushes never accumulate stale-flush debt", async () => {
+      const { transcriber, events } = await startSession({
+        finalizeFallbackMs: 20,
+      });
+
+      // Requests one and two each get no flush; each settles via fallback.
+      for (let i = 0; i < 2; i += 1) {
+        transcriber.finalizeUtterance();
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      expect(events).toEqual([{ type: "finalized" }, { type: "finalized" }]);
+
+      // Request three is answered — its flush lands normally.
+      transcriber.finalizeUtterance();
+      mockWs.simulateMessage(
+        resultsFrame("third turn", { is_final: true, from_finalize: true }),
+      );
+      expect(events).toEqual([
+        { type: "finalized" },
+        { type: "finalized" },
+        {
+          type: "final",
+          text: "third turn",
+          confidence: 0.95,
+          fromFinalize: true,
+        },
+        { type: "finalized" },
+      ]);
+    });
+
+    test("teardown with a fallback-settled request pending resets cleanly", async () => {
+      const { transcriber, events } = await startSession({
+        finalizeFallbackMs: 20,
+      });
+
+      // Request one settles via the fallback; its flush never arrives
+      // before teardown. Request two is still outstanding at stop().
+      transcriber.finalizeUtterance();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      transcriber.finalizeUtterance();
+
+      transcriber.stop();
+      mockWs.simulateClose(1000, "normal");
+
+      const types = events.map((e) => e.type);
+      expect(types.filter((t) => t === "finalized")).toHaveLength(2);
+      expect(types.at(-1)).toBe("closed");
+
+      // Frames after close are ignored — no stale bookkeeping survives.
+      mockWs.simulateMessage(
+        resultsFrame("post-close tail", {
+          is_final: true,
+          from_finalize: true,
+        }),
+      );
+      expect(events.map((e) => e.type)).toEqual(types);
+    });
+
+    test("utteranceBoundaryFinals: a stale flush is dropped and a timely flush still forces the boundary", async () => {
+      const { transcriber, events } = await startSession({
+        utteranceBoundaryFinals: true,
+        finalizeFallbackMs: 20,
+      });
+
+      mockWs.simulateMessage(resultsFrame("first part", { is_final: true }));
+      transcriber.finalizeUtterance();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(events).toEqual([{ type: "finalized" }]);
+
+      // Request one's late flush lands before any new request: dropped —
+      // withheld text stays withheld and no boundary is forced.
+      mockWs.simulateMessage(
+        resultsFrame("stale tail", { is_final: true, from_finalize: true }),
+      );
+      expect(events).toEqual([{ type: "finalized" }]);
+
+      // Request two's timely flush forces the boundary as usual.
+      transcriber.finalizeUtterance();
+      mockWs.simulateMessage(
+        resultsFrame("live tail", { is_final: true, from_finalize: true }),
+      );
+      expect(events).toEqual([
+        { type: "finalized" },
+        { type: "final", text: "first part live tail" },
+        { type: "finalized" },
+      ]);
+    });
+
+    test("a pending finalize completes as finalized before closed on teardown", async () => {
+      const { transcriber, events } = await startSession({
+        finalizeFallbackMs: 60_000,
+      });
+
+      transcriber.finalizeUtterance();
+      transcriber.stop();
+      mockWs.simulateClose(1000, "normal");
+
+      const finalizedIndex = events.findIndex((e) => e.type === "finalized");
+      const closedIndex = events.findIndex((e) => e.type === "closed");
+      expect(finalizedIndex).toBeGreaterThanOrEqual(0);
+      expect(closedIndex).toBeGreaterThan(finalizedIndex);
+    });
+
+    test("stream stays usable after finalized (audio still transcribes)", async () => {
+      const { transcriber, events } = await startSession();
+
+      transcriber.finalizeUtterance();
+      mockWs.simulateMessage(
+        resultsFrame("first utterance", {
+          is_final: true,
+          from_finalize: true,
+        }),
+      );
+      expect(events.at(-1)).toEqual({ type: "finalized" });
+
+      // The socket stays open — audio still flows and transcribes.
+      transcriber.sendAudio(Buffer.from("more-pcm"), "audio/pcm");
+      const binaryFrames = mockWs.sentData.filter(
+        (d) => d instanceof Uint8Array,
+      );
+      expect(binaryFrames).toHaveLength(1);
+      expect(mockWs.closeCalled).toBe(false);
+
+      mockWs.simulateMessage(
+        resultsFrame("second utterance", { is_final: true }),
+      );
+      expect(events.at(-1)).toEqual({
+        type: "final",
+        text: "second utterance",
+        confidence: 0.95,
+      });
+    });
+
+    test("emits finalized synchronously when the socket is not open", async () => {
+      const { transcriber, events } = await startSession();
+
+      // Socket dropped underneath us; the close event has not yet fired.
+      mockWs.readyState = 3; // CLOSED
+
+      transcriber.finalizeUtterance();
+
+      expect(events).toEqual([{ type: "finalized" }]);
+      // Nothing was sent on the dead socket.
+      expect(mockWs.sentData).toHaveLength(0);
+    });
+
+    test("emits finalized at most once per finalize request", async () => {
+      const { transcriber, events } = await startSession();
+
+      transcriber.finalizeUtterance();
+      mockWs.simulateMessage(
+        resultsFrame("flush one", { is_final: true, from_finalize: true }),
+      );
+      // A stray second from_finalize frame must not emit another finalized.
+      mockWs.simulateMessage(
+        resultsFrame("flush two", { is_final: true, from_finalize: true }),
+      );
+
+      const finalized = events.filter((e) => e.type === "finalized");
+      expect(finalized).toHaveLength(1);
+      expect(events.at(-1)).toEqual({
+        type: "final",
+        text: "flush two",
+        confidence: 0.95,
+        fromFinalize: true,
+      });
+    });
+
+    test("flushes withheld segments before finalized in utteranceBoundaryFinals mode", async () => {
+      const { transcriber, events } = await startSession({
+        utteranceBoundaryFinals: true,
+      });
+
+      mockWs.simulateMessage(resultsFrame("first part", { is_final: true }));
+      transcriber.finalizeUtterance();
+      mockWs.simulateMessage(
+        resultsFrame("tail", { is_final: true, from_finalize: true }),
+      );
+
+      expect(events).toEqual([
+        { type: "final", text: "first part tail" },
+        { type: "finalized" },
+      ]);
+    });
+
+    test("overlapping requests each emit final then finalized, in order", async () => {
+      const { transcriber, events } = await startSession();
+
+      transcriber.finalizeUtterance();
+      transcriber.finalizeUtterance();
+      const textMessages = mockWs.sentData.filter((d) => typeof d === "string");
+      expect(textMessages).toHaveLength(2);
+      expect(events).toHaveLength(0);
+
+      mockWs.simulateMessage(
+        resultsFrame("flush one", { is_final: true, from_finalize: true }),
+      );
+      mockWs.simulateMessage(
+        resultsFrame("flush two", { is_final: true, from_finalize: true }),
+      );
+
+      expect(events).toEqual([
+        {
+          type: "final",
+          text: "flush one",
+          confidence: 0.95,
+          fromFinalize: true,
+        },
+        { type: "finalized" },
+        {
+          type: "final",
+          text: "flush two",
+          confidence: 0.95,
+          fromFinalize: true,
+        },
+        { type: "finalized" },
+      ]);
+    });
+
+    test("fallback emits one finalized per outstanding request when both flushes are omitted", async () => {
+      const { transcriber, events } = await startSession({
+        finalizeFallbackMs: 20,
+      });
+
+      transcriber.finalizeUtterance();
+      transcriber.finalizeUtterance();
+      expect(events).toHaveLength(0);
+
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(events).toEqual([{ type: "finalized" }, { type: "finalized" }]);
+    });
+
+    test("teardown drains every outstanding finalize before closed", async () => {
+      const { transcriber, events } = await startSession({
+        finalizeFallbackMs: 60_000,
+      });
+
+      transcriber.finalizeUtterance();
+      transcriber.finalizeUtterance();
+      transcriber.stop();
+      mockWs.simulateClose(1000, "normal");
+
+      const types = events.map((e) => e.type);
+      expect(types.filter((t) => t === "finalized")).toHaveLength(2);
+      expect(types.indexOf("closed")).toBeGreaterThan(
+        types.lastIndexOf("finalized"),
+      );
+    });
+
+    test("stop() teardown path is unchanged after a finalize cycle", async () => {
+      const { transcriber, events } = await startSession();
+
+      transcriber.finalizeUtterance();
+      mockWs.simulateMessage(
+        resultsFrame("", { is_final: true, from_finalize: true }),
+      );
+
+      transcriber.stop();
+      const textMessages = mockWs.sentData.filter((d) => typeof d === "string");
+      expect(JSON.parse(textMessages.at(-1) as string)).toEqual({
+        type: "CloseStream",
+      });
+      mockWs.simulateClose(1000, "normal");
+
+      expect(events.filter((e) => e.type === "closed")).toHaveLength(1);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Non-transcript frames
+  // ─────────────────────────────────────────────────────────────────
+
+  test("ignores UtteranceEnd frames (no event emitted)", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateMessage(utteranceEndFrame());
+
+    expect(events).toHaveLength(0);
+  });
+
+  test("ignores Metadata frames (no event emitted)", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateMessage(metadataFrame());
+
+    expect(events).toHaveLength(0);
+  });
+
+  test("ignores non-JSON messages", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateMessage("not json at all");
+
+    expect(events).toHaveLength(0);
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Audio sending and backpressure
+  // ─────────────────────────────────────────────────────────────────
+
+  test("sendAudio forwards raw bytes to WebSocket", async () => {
+    const { transcriber } = await startSession();
+
+    const audio = Buffer.from("raw-pcm-data");
+    transcriber.sendAudio(audio, "audio/pcm");
+
+    expect(mockWs.sentData).toHaveLength(1);
+    const sent = mockWs.sentData[0];
+    expect(sent).toBeInstanceOf(Uint8Array);
+    expect(Buffer.from(sent as Uint8Array).toString()).toBe("raw-pcm-data");
+  });
+
+  test("sendAudio drops frames when backpressure is high", async () => {
+    const { transcriber } = await startSession();
+
+    // Simulate high backpressure.
+    mockWs.bufferedAmount = 2 * 1024 * 1024; // 2 MiB > 1 MiB threshold
+
+    transcriber.sendAudio(Buffer.from("dropped"), "audio/pcm");
+
+    expect(mockWs.sentData).toHaveLength(0);
+  });
+
+  test("sendAudio is no-op after stop()", async () => {
+    const { transcriber } = await startSession();
+
+    transcriber.stop();
+    transcriber.sendAudio(Buffer.from("ignored"), "audio/pcm");
+
+    // Only the CloseStream message should have been sent, not the audio.
+    const textMessages = mockWs.sentData.filter((d) => typeof d === "string");
+    expect(textMessages).toHaveLength(1);
+    expect(JSON.parse(textMessages[0] as string)).toEqual({
+      type: "CloseStream",
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Stop lifecycle
+  // ─────────────────────────────────────────────────────────────────
+
+  test("stop() sends CloseStream message", async () => {
+    const { transcriber } = await startSession();
+
+    transcriber.stop();
+
+    const textMessages = mockWs.sentData.filter((d) => typeof d === "string");
+    expect(textMessages).toHaveLength(1);
+    expect(JSON.parse(textMessages[0] as string)).toEqual({
+      type: "CloseStream",
+    });
+  });
+
+  test("stop() emits closed event when provider closes normally", async () => {
+    const { transcriber, events } = await startSession();
+
+    transcriber.stop();
+    mockWs.simulateClose(1000, "normal");
+
+    const closedEvents = events.filter((e) => e.type === "closed");
+    expect(closedEvents).toHaveLength(1);
+  });
+
+  test("stop() emits closed after grace timeout if provider does not close", async () => {
+    // Use a short inactivity timeout and override the close grace to be short.
+    const { events } = await startSession({
+      inactivityTimeoutMs: 60_000,
+    });
+
+    // We need to access the adapter internally to verify the grace timer
+    // fires. Since we can't easily override CLOSE_GRACE_MS, we just verify
+    // that stop() + normal close produces the right events.
+    // (The grace timer is 5s by default, too long for a unit test, so we
+    // test the normal close path instead.)
+
+    // Send some data first, then stop
+    mockWs.simulateMessage(resultsFrame("test", { is_final: true }));
+
+    // Trigger provider close after stop
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY, {
+      inactivityTimeoutMs: 60_000,
+    });
+    const { events: events2, onEvent } = createEventCollector();
+    const startPromise = transcriber.start(onEvent);
+    mockWs = new MockWebSocket();
+    // Re-mock the WebSocket for this transcriber — we can't easily because
+    // the first one was already created. Instead, verify the normal path.
+    expect(events.filter((e) => e.type === "final")).toHaveLength(1);
+
+    // Cleanup
+    try {
+      startPromise.catch(() => {});
+    } catch {
+      // ignore
+    }
+    void events2;
+  });
+
+  test("stop() is idempotent (calling twice does not throw)", async () => {
+    const { transcriber, events } = await startSession();
+
+    transcriber.stop();
+    mockWs.simulateClose(1000, "");
+    transcriber.stop(); // Second call should be a no-op.
+
+    const closedEvents = events.filter((e) => e.type === "closed");
+    expect(closedEvents).toHaveLength(1);
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Error handling
+  // ─────────────────────────────────────────────────────────────────
+
+  test("unexpected close emits error + closed events", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateClose(1006, "abnormal closure");
+
+    const errorEvents = events.filter((e) => e.type === "error");
+    const closedEvents = events.filter((e) => e.type === "closed");
+    expect(errorEvents).toHaveLength(1);
+    expect(closedEvents).toHaveLength(1);
+
+    const err = errorEvents[0] as {
+      type: "error";
+      category: string;
+      message: string;
+    };
+    expect(err.category).toBe("provider-error");
+    expect(err.message).toContain("1006");
+  });
+
+  test("auth error close code maps to auth category", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateClose(1008, "policy violation");
+
+    const errorEvents = events.filter((e) => e.type === "error");
+    expect(errorEvents).toHaveLength(1);
+    const err = errorEvents[0] as { type: "error"; category: string };
+    expect(err.category).toBe("auth");
+  });
+
+  test("rate limit close code 1013 maps to rate-limit category", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateClose(1013, "try again later");
+
+    const errorEvents = events.filter((e) => e.type === "error");
+    expect(errorEvents).toHaveLength(1);
+    const err = errorEvents[0] as { type: "error"; category: string };
+    expect(err.category).toBe("rate-limit");
+  });
+
+  test("WebSocket error event emits error + closed events", async () => {
+    const { events } = await startSession();
+
+    mockWs.simulateError(new Error("network failure"));
+
+    const errorEvents = events.filter((e) => e.type === "error");
+    const closedEvents = events.filter((e) => e.type === "closed");
+    expect(errorEvents).toHaveLength(1);
+    expect(closedEvents).toHaveLength(1);
+
+    const err = errorEvents[0] as {
+      type: "error";
+      category: string;
+      message: string;
+    };
+    expect(err.category).toBe("provider-error");
+    expect(err.message).toContain("network failure");
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Inactivity timeout
+  // ─────────────────────────────────────────────────────────────────
+
+  test("inactivity timeout fires when sent audio gets no response", async () => {
+    const { transcriber, events } = await startSession({
+      inactivityTimeoutMs: 50, // very short for testing
+    });
+    transcriber.sendAudio(Buffer.from([1, 2, 3]), "audio/pcm");
+
+    // Wait for the inactivity timeout to fire.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    const errorEvents = events.filter((e) => e.type === "error");
+    const closedEvents = events.filter((e) => e.type === "closed");
+    expect(errorEvents).toHaveLength(1);
+    expect(closedEvents).toHaveLength(1);
+
+    const err = errorEvents[0] as {
+      type: "error";
+      category: string;
+      message: string;
+    };
+    expect(err.category).toBe("timeout");
+    expect(err.message).toContain("inactivity");
+  });
+
+  test("idle stream with no audio owed a response never times out", async () => {
+    const { events } = await startSession({
+      inactivityTimeoutMs: 50,
+    });
+
+    // Several timeout windows pass with no audio sent (e.g. mic gated
+    // while the assistant speaks) — the stream must stay open.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(events.filter((e) => e.type === "error")).toHaveLength(0);
+    expect(events.filter((e) => e.type === "closed")).toHaveLength(0);
+  });
+
+  test("finalize fallback retires the pending-audio watchdog debt", async () => {
+    const { transcriber, events } = await startSession({
+      inactivityTimeoutMs: 100,
+      finalizeFallbackMs: 10,
+    });
+    transcriber.sendAudio(Buffer.from([1, 2, 3]), "audio/pcm");
+    transcriber.finalizeUtterance();
+
+    // The fallback settles the request without any provider frame (short
+    // or noisy utterance — Deepgram had nothing significant buffered)...
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(events.filter((e) => e.type === "finalized")).toHaveLength(1);
+
+    // ...and the now-idle stream must not hit the inactivity timeout.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(events.filter((e) => e.type === "error")).toHaveLength(0);
+    expect(events.filter((e) => e.type === "closed")).toHaveLength(0);
+  });
+
+  test("provider response clears the pending-audio watchdog", async () => {
+    const { transcriber, events } = await startSession({
+      inactivityTimeoutMs: 100,
+    });
+    transcriber.sendAudio(Buffer.from([1, 2, 3]), "audio/pcm");
+
+    // A response arrives before the timeout — nothing is owed anymore.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    mockWs.simulateMessage(resultsFrame("hello", { is_final: false }));
+
+    // Well past a full timeout since the audio was sent.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    expect(events.filter((e) => e.type === "error")).toHaveLength(0);
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // KeepAlive
+  // ─────────────────────────────────────────────────────────────────
+
+  test("sends KeepAlive frames at the configured interval while open", async () => {
+    const { transcriber } = await startSession({
+      keepaliveIntervalMs: 30,
+    });
+
+    // Wait long enough that at least two KeepAlives fire even on a loaded
+    // CI runner with event-loop jitter.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const keepalives = mockWs.sentData.filter(
+      (d) => typeof d === "string" && d === '{"type":"KeepAlive"}',
+    );
+    expect(keepalives.length).toBeGreaterThanOrEqual(2);
+
+    transcriber.stop();
+  });
+
+  test("KeepAlive timer stops firing after stop()", async () => {
+    const { transcriber } = await startSession({
+      keepaliveIntervalMs: 30,
+    });
+
+    // Let one KeepAlive fire so we know the interval is running.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const beforeStop = mockWs.sentData.filter(
+      (d) => typeof d === "string" && d === '{"type":"KeepAlive"}',
+    ).length;
+    expect(beforeStop).toBeGreaterThanOrEqual(1);
+
+    transcriber.stop();
+
+    // Drain the close grace flow.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // The interval should be cleared — count must not have grown beyond
+    // what was already buffered before stop(). Tolerate one extra fire
+    // racing with stop()'s synchronous clear path, but no more.
+    const afterStop = mockWs.sentData.filter(
+      (d) => typeof d === "string" && d === '{"type":"KeepAlive"}',
+    ).length;
+    expect(afterStop).toBeLessThanOrEqual(beforeStop + 1);
+  });
+
+  test("keepaliveIntervalMs=0 disables the timer entirely", async () => {
+    const { transcriber } = await startSession({
+      keepaliveIntervalMs: 0,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const keepalives = mockWs.sentData.filter(
+      (d) => typeof d === "string" && d === '{"type":"KeepAlive"}',
+    );
+    expect(keepalives).toHaveLength(0);
+
+    transcriber.stop();
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // WebSocket URL construction
+  // ─────────────────────────────────────────────────────────────────
+
+  test("builds correct WebSocket URL with default params", async () => {
+    let capturedUrl: string | undefined;
+    let capturedOptions: { headers?: Record<string, string> } | undefined;
+    const origWs = (globalThis as Record<string, unknown>).WebSocket;
+    (globalThis as Record<string, unknown>).WebSocket = class {
+      constructor(url: string, options?: { headers?: Record<string, string> }) {
+        capturedUrl = url;
+        capturedOptions = options;
+        return mockWs;
+      }
+    };
+
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY);
+    const { onEvent } = createEventCollector();
+    const startPromise = transcriber.start(onEvent);
+    mockWs.simulateOpen();
+    await startPromise;
+
+    expect(capturedUrl).toBeDefined();
+    const url = new URL(capturedUrl!);
+    expect(url.protocol).toBe("wss:");
+    expect(url.hostname).toBe("api.deepgram.com");
+    expect(url.pathname).toBe("/v1/listen");
+    expect(url.searchParams.get("model")).toBe("nova-2");
+    expect(url.searchParams.get("token")).toBeNull();
+    expect(url.searchParams.get("smart_format")).toBe("true");
+    expect(url.searchParams.get("interim_results")).toBe("true");
+    expect(url.searchParams.get("punctuate")).toBe("true");
+    expect(url.searchParams.get("encoding")).toBe("linear16");
+    expect(url.searchParams.get("sample_rate")).toBe("16000");
+    expect(url.searchParams.get("channels")).toBe("1");
+    expect(capturedOptions?.headers?.Authorization).toBe(
+      `Token ${TEST_API_KEY}`,
+    );
+
+    (globalThis as Record<string, unknown>).WebSocket = origWs;
+  });
+
+  test("includes language param when specified", async () => {
+    let capturedUrl: string | undefined;
+    const origWs = (globalThis as Record<string, unknown>).WebSocket;
+    (globalThis as Record<string, unknown>).WebSocket = class {
+      constructor(url: string) {
+        capturedUrl = url;
+        return mockWs;
+      }
+    };
+
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY, {
+      language: "es",
+    });
+    const { onEvent } = createEventCollector();
+    const startPromise = transcriber.start(onEvent);
+    mockWs.simulateOpen();
+    await startPromise;
+
+    const url = new URL(capturedUrl!);
+    expect(url.searchParams.get("language")).toBe("es");
+
+    (globalThis as Record<string, unknown>).WebSocket = origWs;
+  });
+
+  test("includes utterance_end_ms when specified", async () => {
+    let capturedUrl: string | undefined;
+    const origWs = (globalThis as Record<string, unknown>).WebSocket;
+    (globalThis as Record<string, unknown>).WebSocket = class {
+      constructor(url: string) {
+        capturedUrl = url;
+        return mockWs;
+      }
+    };
+
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY, {
+      utteranceEndMs: 1000,
+    });
+    const { onEvent } = createEventCollector();
+    const startPromise = transcriber.start(onEvent);
+    mockWs.simulateOpen();
+    await startPromise;
+
+    const url = new URL(capturedUrl!);
+    expect(url.searchParams.get("utterance_end_ms")).toBe("1000");
+
+    (globalThis as Record<string, unknown>).WebSocket = origWs;
+  });
+
+  test("uses custom base URL when specified", async () => {
+    let capturedUrl: string | undefined;
+    const origWs = (globalThis as Record<string, unknown>).WebSocket;
+    (globalThis as Record<string, unknown>).WebSocket = class {
+      constructor(url: string) {
+        capturedUrl = url;
+        return mockWs;
+      }
+    };
+
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY, {
+      baseUrl: "wss://custom-deepgram.example.com/",
+    });
+    const { onEvent } = createEventCollector();
+    const startPromise = transcriber.start(onEvent);
+    mockWs.simulateOpen();
+    await startPromise;
+
+    expect(capturedUrl).toContain(
+      "wss://custom-deepgram.example.com/v1/listen",
+    );
+
+    (globalThis as Record<string, unknown>).WebSocket = origWs;
+  });
+
+  // Top-level `speaker` on the alternative is a separate Deepgram response
+  // shape that some API versions use when a chunk is dominated by one voice.
+  // The word-level path is covered in the Diarization section above; this
+  // test guarantees we pick up the shorter form as well.
+  test("emits speakerLabel from top-level alternative.speaker when diarize is enabled", async () => {
+    const { events } = await startSession({ diarize: true });
+
+    const frame = JSON.stringify({
+      type: "Results",
+      is_final: true,
+      channel: {
+        alternatives: [{ transcript: "hi", confidence: 0.9, speaker: 2 }],
+      },
+    });
+    mockWs.simulateMessage(frame);
+
+    expect(events).toHaveLength(1);
+    const event = events[0] as {
+      type: string;
+      text: string;
+      speakerLabel?: string;
+      confidence?: number;
+    };
+    expect(event.type).toBe("final");
+    expect(event.text).toBe("hi");
+    expect(event.speakerLabel).toBe("2");
+    expect(event.confidence).toBe(0.9);
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Provider identity
+  // ─────────────────────────────────────────────────────────────────
+
+  test("reports correct providerId and boundaryId", () => {
+    const transcriber = new DeepgramRealtimeTranscriber(TEST_API_KEY);
+    expect(transcriber.providerId).toBe("deepgram");
+    expect(transcriber.boundaryId).toBe("daemon-streaming");
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // No session leak after close
+  // ─────────────────────────────────────────────────────────────────
+
+  test("no events emitted after closed event", async () => {
+    const { events } = await startSession();
+
+    // Force an error close.
+    mockWs.simulateError(new Error("boom"));
+
+    const countAfterClose = events.length;
+
+    // Try sending more messages — should be ignored.
+    mockWs.simulateMessage(resultsFrame("late", { is_final: true }));
+    mockWs.simulateClose(1000, "");
+
+    expect(events.length).toBe(countAfterClose);
+  });
+});

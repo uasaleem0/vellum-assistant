@@ -1,0 +1,109 @@
+import { maybeDefaultSpeechToManaged } from "../config/managed-speech-defaults.js";
+import { rehydratePlatformCredentials } from "../config/platform-rehydration.js";
+import type { AssistantConfig } from "../config/types.js";
+import { buildEffectiveMcpConfig } from "../mcp/effective-config.js";
+import { getMcpServerManager } from "../mcp/manager.js";
+import { gmailMessagingProvider } from "../messaging/providers/gmail/adapter.js";
+import { outlookMessagingProvider } from "../messaging/providers/outlook/adapter.js";
+import { slackProvider as slackMessagingProvider } from "../messaging/providers/slack/adapter.js";
+import { telegramBotMessagingProvider } from "../messaging/providers/telegram-bot/adapter.js";
+import { whatsappMessagingProvider } from "../messaging/providers/whatsapp/adapter.js";
+import { registerMessagingProvider } from "../messaging/registry.js";
+import { initializeProviders } from "../providers/registry.js";
+import { validateSubagentRoleAllowlists } from "../subagent/validate-allowlists.js";
+import { createMcpToolsFromServer } from "../tools/mcp/mcp-tool-factory.js";
+import { initializeTools, registerMcpTools } from "../tools/registry.js";
+import { getLogger } from "../util/logger.js";
+import { initWatcherEngine } from "../watcher/engine.js";
+import { registerWatcherProvider } from "../watcher/provider-registry.js";
+import { githubProvider } from "../watcher/providers/github.js";
+import { gmailProvider } from "../watcher/providers/gmail.js";
+import { googleCalendarProvider } from "../watcher/providers/google-calendar.js";
+import { linearProvider } from "../watcher/providers/linear.js";
+import { outlookProvider } from "../watcher/providers/outlook.js";
+import { outlookCalendarProvider } from "../watcher/providers/outlook-calendar.js";
+const log = getLogger("lifecycle");
+
+export async function initializeProvidersAndTools(
+  config: AssistantConfig,
+): Promise<void> {
+  log.info("Daemon startup: initializing providers and tools");
+
+  // Rehydrate the platform base URL and IDs from the credential store so
+  // managed proxy activation survives assistant restarts. The in-memory
+  // overrides are normally only set by the secret-routes handlers at runtime.
+  await rehydratePlatformCredentials();
+
+  // Speech defaulting normally fires when the platform credentials land
+  // (secret-routes); evaluating it once per boot also covers assistants whose
+  // connection predates that trigger, so voice works for every connected
+  // assistant with no configured speech credentials. Idempotent, and detached
+  // per the startup philosophy — must not block boot.
+  void maybeDefaultSpeechToManaged();
+
+  await initializeProviders(config);
+  // initializeTools() also loads workspace tool overrides from
+  // `<workspaceDir>/tools/` once core tools have settled, so they own
+  // their names before the MCP / plugin registrations below run.
+  await initializeTools();
+
+  // Validate subagent role tool-allowlists against the now-registered core
+  // tool set (every allowlisted name is a core manifest tool, so they are
+  // all present at this point). A renamed tool would otherwise silently strip a
+  // role's access — the stale name just never matches. Warn-and-continue per
+  // the daemon startup philosophy: a stale allowlist is a logic bug, not a
+  // reason to refuse boot.
+  try {
+    validateSubagentRoleAllowlists();
+  } catch (err) {
+    log.warn(
+      { err },
+      "Subagent role allowlist validation failed — continuing startup",
+    );
+  }
+
+  // Start MCP servers — workspace-configured and plugin-declared alike —
+  // and register their tools.
+  const mcpConfig = buildEffectiveMcpConfig(config.mcp);
+  if (Object.keys(mcpConfig.servers).length > 0) {
+    const manager = getMcpServerManager();
+    try {
+      const serverToolInfos = await manager.start(mcpConfig);
+      for (const { serverId, serverConfig, tools } of serverToolInfos) {
+        const mcpTools = createMcpToolsFromServer(
+          tools,
+          serverId,
+          serverConfig,
+          manager,
+        );
+        registerMcpTools(serverId, mcpTools);
+      }
+    } catch (err) {
+      log.error(
+        { err },
+        "MCP server initialization failed — continuing without MCP tools",
+      );
+    }
+  }
+
+  log.info("Daemon startup: providers and tools initialized");
+}
+
+export function registerWatcherProviders(): void {
+  registerWatcherProvider(gmailProvider);
+  registerWatcherProvider(googleCalendarProvider);
+  registerWatcherProvider(githubProvider);
+  registerWatcherProvider(linearProvider);
+  registerWatcherProvider(outlookProvider);
+  registerWatcherProvider(outlookCalendarProvider);
+
+  initWatcherEngine();
+}
+
+export function registerMessagingProviders(): void {
+  registerMessagingProvider(slackMessagingProvider);
+  registerMessagingProvider(gmailMessagingProvider);
+  registerMessagingProvider(outlookMessagingProvider);
+  registerMessagingProvider(telegramBotMessagingProvider);
+  registerMessagingProvider(whatsappMessagingProvider);
+}

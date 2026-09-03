@@ -1,0 +1,91 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, mock, test } from "bun:test";
+
+const noopLogger = new Proxy({} as Record<string, unknown>, {
+  get: (_target, prop) => (prop === "child" ? () => noopLogger : () => {}),
+});
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const realLogger = require("../util/logger.js");
+mock.module("../util/logger.js", () => ({
+  ...realLogger,
+  getLogger: () => noopLogger,
+  getCliLogger: () => noopLogger,
+  truncateForLog: (v: string) => v,
+  initLogger: () => {},
+  pruneOldLogFiles: () => 0,
+}));
+
+// ── Import after mocks ───────────────────────────────────────────────
+const { buildSystemPrompt } = await import("../prompts/system-prompt.js");
+
+// Load schedule_create description from the bundled skill TOOLS.json
+const scheduleToolsJson = JSON.parse(
+  readFileSync(
+    join(import.meta.dirname, "../config/bundled-skills/schedule/TOOLS.json"),
+    "utf-8",
+  ),
+);
+const scheduleCreateDef = scheduleToolsJson.tools.find(
+  (t: { name: string }) => t.name === "schedule_create",
+);
+
+// =====================================================================
+// 1. Routing section removed from system prompt — guidance in tool descriptions
+// =====================================================================
+
+describe("Task/Schedule routing NOT in system prompt (moved to tool descriptions)", () => {
+  test("system prompt does not contain the old routing section", () => {
+    const prompt = buildSystemPrompt();
+    expect(prompt).not.toContain(
+      "## Tool Routing: Tasks vs Schedules vs Notifications",
+    );
+  });
+});
+
+// =====================================================================
+// 2. Tool description content: routing keywords
+// =====================================================================
+
+describe("schedule_create tool description", () => {
+  test("mentions recurring scheduled automation", () => {
+    expect(scheduleCreateDef).toBeDefined();
+    expect(scheduleCreateDef.description).toContain("recurring");
+  });
+
+  test("mentions cron interval", () => {
+    expect(scheduleCreateDef.description).toContain("cron");
+  });
+
+  test("requires an authored description", () => {
+    expect(scheduleCreateDef.input_schema.required).toContain("description");
+    expect(
+      scheduleCreateDef.input_schema.properties.description.description,
+    ).toContain("what it does and why");
+  });
+
+  test("does NOT suggest it handles task queue items", () => {
+    expect(scheduleCreateDef.description).not.toContain("task queue");
+    expect(scheduleCreateDef.description).not.toContain("one-off");
+  });
+});
+
+// =====================================================================
+// 3. Activation hints in skills catalog (replaces domain routing sections)
+// =====================================================================
+
+describe("Skills catalog and routing sections removed from system prompt", () => {
+  test("domain routing sections are no longer in system prompt", () => {
+    const prompt = buildSystemPrompt();
+    expect(prompt).not.toContain("## Routing: Guardian Verification");
+    expect(prompt).not.toContain("## Routing: Phone Calls");
+    expect(prompt).not.toContain("## Routing: Voice Setup");
+    expect(prompt).not.toContain("## Routing: Starter Tasks");
+  });
+
+  test("skills catalog is no longer in system prompt", () => {
+    const prompt = buildSystemPrompt();
+    expect(prompt).not.toContain("## Available Skills");
+  });
+});

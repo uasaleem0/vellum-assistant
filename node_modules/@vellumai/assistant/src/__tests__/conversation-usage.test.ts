@@ -1,0 +1,612 @@
+import { beforeEach, describe, expect, mock, test } from "bun:test";
+
+const updateConversationUsageCalls: Array<{
+  conversationId: string;
+  inputTokens: number;
+  outputTokens: number;
+  estimatedCost: number;
+}> = [];
+
+let updateConversationUsageFailures = 0;
+let updateConversationUsageFailureCode = "SQLITE_BUSY";
+
+function sqliteError(code: string): Error {
+  const err = new Error("database is locked") as Error & { code: string };
+  err.code = code;
+  return err;
+}
+
+mock.module("../persistence/conversation-crud.js", () => ({
+  setConversationProcessingStartedAt: () => {},
+  isConversationProcessing: () => false,
+  updateConversationUsage: (
+    conversationId: string,
+    inputTokens: number,
+    outputTokens: number,
+    estimatedCost: number,
+  ) => {
+    if (updateConversationUsageFailures > 0) {
+      updateConversationUsageFailures--;
+      throw sqliteError(updateConversationUsageFailureCode);
+    }
+    updateConversationUsageCalls.push({
+      conversationId,
+      inputTokens,
+      outputTokens,
+      estimatedCost,
+    });
+  },
+  reserveMessage: mock(async () => ({ id: "msg-reserve" })),
+}));
+
+import { recordUsage } from "../daemon/conversation-usage.js";
+import { getDb } from "../persistence/db-connection.js";
+import { initializeDb } from "../persistence/db-init.js";
+import { listUsageEvents } from "../persistence/llm-usage-store.js";
+import type { Provider, ProviderResponse } from "../providers/types.js";
+import { UsageTrackingProvider } from "../providers/usage-tracking.js";
+import type { PricingUsage } from "../usage/types.js";
+import { resolvePricingForUsageWithOverrides } from "../util/pricing.js";
+import { setConfig } from "./helpers/set-config.js";
+import { waitFor } from "./helpers/wait-for.js";
+
+await initializeDb();
+
+// The attribution assertions resolve profiles/call sites through the real
+// workspace config, so seed the fixtures the tests reference.
+setConfig("llm", {
+  profiles: {
+    conversationProfile: {
+      provider: "openai",
+      model: "gpt-4o",
+    },
+    summaryProfile: {
+      provider: "anthropic",
+      model: "claude-haiku-3",
+    },
+  },
+  callSites: {
+    conversationSummarization: {
+      profile: "summaryProfile",
+    },
+  },
+});
+
+describe("recordUsage", () => {
+  beforeEach(() => {
+    const db = getDb();
+    db.run(`DELETE FROM llm_usage_events`);
+    updateConversationUsageCalls.length = 0;
+    updateConversationUsageFailures = 0;
+    updateConversationUsageFailureCode = "SQLITE_BUSY";
+  });
+
+  test("applies fast mode pricing when any response has speed: fast", () => {
+    const usageStats = {
+      inputTokens: 0,
+      outputTokens: 0,
+      estimatedCost: 0,
+    };
+
+    // First response is standard, second is fast — should detect fast
+    const rawResponses = [
+      { usage: { speed: "standard" } },
+      { usage: { speed: "fast" } },
+    ];
+
+    recordUsage(
+      {
+        conversationId: "conv-speed-1",
+        providerName: "anthropic",
+        usageStats,
+      },
+      1_000_000,
+      1_000_000,
+      "claude-opus-4-6",
+      () => {},
+      "main_agent",
+      "req-speed-1",
+      0,
+      0,
+      rawResponses,
+    );
+
+    const events = listUsageEvents();
+    expect(events).toHaveLength(1);
+
+    // With fast mode, pricing should use the 6x multiplier
+    const fastUsage: PricingUsage = {
+      directInputTokens: 1_000_000,
+      outputTokens: 1_000_000,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 0,
+      anthropicCacheCreation: null,
+      speed: "fast",
+    };
+    const expectedPricing = resolvePricingForUsageWithOverrides(
+      "anthropic",
+      "claude-opus-4-6",
+      fastUsage,
+      [],
+    );
+
+    expect(events[0].estimatedCostUsd).toBe(
+      expectedPricing.estimatedCostUsd ?? null,
+    );
+    // Sanity: fast should be 6x standard (claude-opus-4-6 at $5/$25 → $30 * 6 = $180)
+    expect(expectedPricing.estimatedCostUsd).toBe(180);
+  });
+
+  test("stores direct input separately from Anthropic cache usage while keeping live totals combined", () => {
+    const usageStats = {
+      inputTokens: 0,
+      outputTokens: 0,
+      estimatedCost: 0,
+    };
+    const onEventMessages: unknown[] = [];
+
+    const rawResponses = [
+      {
+        usage: {
+          cache_creation: {
+            ephemeral_5m_input_tokens: 173_619,
+          },
+        },
+      },
+      {
+        usage: {
+          cache_creation: {
+            ephemeral_1h_input_tokens: 200_000,
+          },
+        },
+      },
+    ];
+
+    recordUsage(
+      {
+        conversationId: "conv-usage-1",
+        providerName: "anthropic",
+        usageStats,
+      },
+      3_420_218,
+      11_768,
+      "claude-opus-4-6",
+      (msg) => onEventMessages.push(msg),
+      "main_agent",
+      "req-usage-1",
+      373_619,
+      3_046_461,
+      rawResponses,
+    );
+
+    const events = listUsageEvents();
+    expect(events).toHaveLength(1);
+
+    const expectedUsage: PricingUsage = {
+      directInputTokens: 138,
+      outputTokens: 11_768,
+      cacheCreationInputTokens: 373_619,
+      cacheReadInputTokens: 3_046_461,
+      anthropicCacheCreation: {
+        ephemeral_5m_input_tokens: 173_619,
+        ephemeral_1h_input_tokens: 200_000,
+      },
+    };
+    const expectedPricing = resolvePricingForUsageWithOverrides(
+      "anthropic",
+      "claude-opus-4-6",
+      expectedUsage,
+      [],
+    );
+
+    expect(events[0].conversationId).toBe("conv-usage-1");
+    expect(events[0].requestId).toBe("req-usage-1");
+    expect(events[0].inputTokens).toBe(138);
+    expect(events[0].outputTokens).toBe(11_768);
+    expect(events[0].cacheCreationInputTokens).toBe(373_619);
+    expect(events[0].cacheReadInputTokens).toBe(3_046_461);
+    expect(events[0].pricingStatus).toBe("priced");
+    expect(events[0].estimatedCostUsd).toBe(
+      expectedPricing.estimatedCostUsd ?? null,
+    );
+
+    expect(usageStats.inputTokens).toBe(3_420_218);
+    expect(usageStats.outputTokens).toBe(11_768);
+    expect(usageStats.estimatedCost).toBe(
+      expectedPricing.estimatedCostUsd ?? 0,
+    );
+
+    expect(updateConversationUsageCalls).toEqual([
+      {
+        conversationId: "conv-usage-1",
+        inputTokens: 3_420_218,
+        outputTokens: 11_768,
+        estimatedCost: expectedPricing.estimatedCostUsd ?? 0,
+      },
+    ]);
+
+    expect(onEventMessages).toEqual([
+      {
+        type: "usage_update",
+        conversationId: "conv-usage-1",
+        inputTokens: 3_420_218,
+        outputTokens: 11_768,
+        cacheCreationInputTokens: 373_619,
+        cacheReadInputTokens: 3_046_461,
+        totalInputTokens: 3_420_218,
+        totalOutputTokens: 11_768,
+        estimatedCost: expectedPricing.estimatedCostUsd ?? 0,
+        model: "claude-opus-4-6",
+      },
+    ]);
+  });
+
+  test("manual provider usage tracking leaves conversation aggregate recording as the only ledger row", async () => {
+    const response: ProviderResponse = {
+      content: [{ type: "text", text: "ok" }],
+      model: "gpt-5.4-mini",
+      usage: {
+        inputTokens: 1_000,
+        outputTokens: 2_000,
+      },
+      stopReason: "end_turn",
+    };
+    const provider: Provider = {
+      name: "openai",
+      async sendMessage() {
+        return response;
+      },
+    };
+    const wrapped = new UsageTrackingProvider(provider);
+
+    await wrapped.sendMessage(
+      [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+      {
+        config: {
+          callSite: "mainAgent",
+          usageTracking: "manual",
+        },
+      },
+    );
+    expect(listUsageEvents()).toHaveLength(0);
+
+    const usageStats = {
+      inputTokens: 0,
+      outputTokens: 0,
+      estimatedCost: 0,
+    };
+
+    recordUsage(
+      {
+        conversationId: "conv-manual-1",
+        providerName: "openai",
+        usageStats,
+      },
+      response.usage.inputTokens,
+      response.usage.outputTokens,
+      response.model,
+      () => {},
+      "main_agent",
+      "req-manual-1",
+    );
+
+    const events = listUsageEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      actor: "main_agent",
+      conversationId: "conv-manual-1",
+      requestId: "req-manual-1",
+      provider: "openai",
+      model: "gpt-5.4-mini",
+      inputTokens: 1_000,
+      outputTokens: 2_000,
+    });
+  });
+
+  test("persists resolved main-agent attribution from input without changing totals", () => {
+    const usageStats = {
+      inputTokens: 0,
+      outputTokens: 0,
+      estimatedCost: 0,
+    };
+
+    recordUsage(
+      {
+        conversationId: "conv-attrib-1",
+        providerName: "openai",
+        usageStats,
+      },
+      100,
+      20,
+      "gpt-4o",
+      () => {},
+      "main_agent",
+      "req-attrib-1",
+      0,
+      0,
+      undefined,
+      1,
+      undefined,
+      {
+        callSite: "mainAgent",
+        overrideProfile: "conversationProfile",
+      },
+    );
+
+    const events = listUsageEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      actor: "main_agent",
+      provider: "openai",
+      model: "gpt-4o",
+      inputTokens: 100,
+      outputTokens: 20,
+      callSite: "mainAgent",
+      inferenceProfile: "conversationProfile",
+      inferenceProfileSource: "conversation",
+    });
+    expect(usageStats.inputTokens).toBe(100);
+    expect(usageStats.outputTokens).toBe(20);
+  });
+
+  test("persists compaction attribution using the summary call-site profile", () => {
+    const usageStats = {
+      inputTokens: 0,
+      outputTokens: 0,
+      estimatedCost: 0,
+    };
+
+    recordUsage(
+      {
+        conversationId: "conv-attrib-2",
+        providerName: "anthropic",
+        usageStats,
+      },
+      500,
+      80,
+      "claude-haiku-3",
+      () => {},
+      "context_compactor",
+      "req-attrib-2",
+      0,
+      0,
+      undefined,
+      1,
+      undefined,
+      // No override profile: an override wins selection at every call site
+      // (covered by the main-agent test above), so attribution lands on the
+      // call-site rung only when the turn carries no override.
+      {
+        callSite: "conversationSummarization",
+      },
+    );
+
+    const events = listUsageEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      actor: "context_compactor",
+      provider: "anthropic",
+      model: "claude-haiku-3",
+      inputTokens: 500,
+      outputTokens: 80,
+      callSite: "conversationSummarization",
+      inferenceProfile: "summaryProfile",
+      inferenceProfileSource: "call_site",
+    });
+  });
+
+  test("persists a pre-resolved attribution snapshot", () => {
+    const usageStats = {
+      inputTokens: 0,
+      outputTokens: 0,
+      estimatedCost: 0,
+    };
+
+    recordUsage(
+      {
+        conversationId: "conv-attrib-3",
+        providerName: "anthropic",
+        usageStats,
+      },
+      25,
+      5,
+      "claude-opus-4-6",
+      () => {},
+      "main_agent",
+      "req-attrib-3",
+      0,
+      0,
+      undefined,
+      1,
+      undefined,
+      {
+        callSite: "mainAgent",
+        activeProfile: null,
+        overrideProfile: null,
+        callSiteProfile: null,
+        appliedProfile: null,
+        profileSource: "default",
+        resolvedProvider: "anthropic",
+        resolvedModel: "claude-opus-4-6",
+      },
+    );
+
+    const events = listUsageEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      callSite: "mainAgent",
+      inferenceProfile: null,
+      inferenceProfileSource: "default",
+    });
+  });
+
+  test("transient SQLITE_BUSY on the totals write never escapes and retries persist the totals", async () => {
+    const usageStats = { inputTokens: 0, outputTokens: 0, estimatedCost: 0 };
+    // Sync attempt fails, first background retry fails, second succeeds.
+    updateConversationUsageFailures = 2;
+
+    recordUsage(
+      {
+        conversationId: "conv-busy-1",
+        providerName: "openai",
+        usageStats,
+      },
+      100,
+      20,
+      "gpt-4o",
+      () => {},
+      "main_agent",
+    );
+
+    // The throwing write must not have escaped into the caller, and the
+    // in-memory accumulator must already reflect the event.
+    expect(usageStats.inputTokens).toBe(100);
+    expect(usageStats.outputTokens).toBe(20);
+
+    await waitFor(() => updateConversationUsageCalls.length === 1, {
+      timeoutMs: 3_000,
+    });
+    expect(updateConversationUsageCalls[0]).toMatchObject({
+      conversationId: "conv-busy-1",
+      inputTokens: 100,
+      outputTokens: 20,
+    });
+  });
+
+  test("exhausted retries are tolerated and the next usage event self-heals the totals", async () => {
+    const usageStats = { inputTokens: 0, outputTokens: 0, estimatedCost: 0 };
+    // More failures than the sync attempt (1) plus the retry chain's
+    // initial-plus-3-retries budget (4), so the first event's write is
+    // dropped entirely.
+    updateConversationUsageFailures = 100;
+
+    recordUsage(
+      {
+        conversationId: "conv-busy-2",
+        providerName: "openai",
+        usageStats,
+      },
+      100,
+      20,
+      "gpt-4o",
+      () => {},
+      "main_agent",
+    );
+
+    await waitFor(() => updateConversationUsageFailures === 95, {
+      timeoutMs: 3_000,
+    });
+    // Give the chain a beat to settle after its final failure.
+    await Bun.sleep(50);
+    expect(updateConversationUsageCalls).toHaveLength(0);
+
+    updateConversationUsageFailures = 0;
+    recordUsage(
+      {
+        conversationId: "conv-busy-2",
+        providerName: "openai",
+        usageStats,
+      },
+      50,
+      10,
+      "gpt-4o",
+      () => {},
+      "main_agent",
+    );
+
+    // The second event's write carries the cumulative totals, healing the
+    // dropped first write.
+    await waitFor(() => updateConversationUsageCalls.length === 1, {
+      timeoutMs: 3_000,
+    });
+    expect(updateConversationUsageCalls[0]).toMatchObject({
+      conversationId: "conv-busy-2",
+      inputTokens: 150,
+      outputTokens: 30,
+    });
+  });
+
+  test("a usage event landing mid-retry coalesces and stale totals never overwrite newer ones", async () => {
+    const usageStats = { inputTokens: 0, outputTokens: 0, estimatedCost: 0 };
+    // Sync attempt and the first two background attempts fail, leaving the
+    // chain alive in backoff while the second event lands.
+    updateConversationUsageFailures = 3;
+
+    const ctx = {
+      conversationId: "conv-busy-3",
+      providerName: "openai",
+      usageStats,
+    };
+    recordUsage(ctx, 100, 20, "gpt-4o", () => {}, "main_agent");
+    recordUsage(ctx, 50, 10, "gpt-4o", () => {}, "main_agent");
+
+    await waitFor(
+      () =>
+        updateConversationUsageCalls.some(
+          (call) => call.inputTokens === 150 && call.outputTokens === 30,
+        ),
+      { timeoutMs: 3_000 },
+    );
+    // Wait out any straggling coalesced write, then confirm nothing stale
+    // landed after the cumulative totals.
+    await Bun.sleep(300);
+    const last = updateConversationUsageCalls.at(-1);
+    expect(last).toMatchObject({
+      conversationId: "conv-busy-3",
+      inputTokens: 150,
+      outputTokens: 30,
+    });
+  });
+
+  test("a non-retryable write error is tolerated without retrying", async () => {
+    const usageStats = { inputTokens: 0, outputTokens: 0, estimatedCost: 0 };
+    updateConversationUsageFailures = 1;
+    updateConversationUsageFailureCode = "SQLITE_CORRUPT";
+
+    recordUsage(
+      {
+        conversationId: "conv-corrupt-1",
+        providerName: "openai",
+        usageStats,
+      },
+      100,
+      20,
+      "gpt-4o",
+      () => {},
+      "main_agent",
+    );
+
+    // No background chain: the failure budget is spent on the sync attempt
+    // and nothing retries afterwards.
+    await Bun.sleep(300);
+    expect(updateConversationUsageCalls).toHaveLength(0);
+    expect(usageStats.inputTokens).toBe(100);
+  });
+
+  test("NaN token counts never reach persistence and a poisoned total self-heals", () => {
+    const usageStats = {
+      inputTokens: Number.NaN,
+      outputTokens: 5,
+      estimatedCost: Number.NaN,
+    };
+
+    recordUsage(
+      {
+        conversationId: "conv-nan-1",
+        providerName: "anthropic",
+        usageStats,
+      },
+      Number.NaN,
+      10,
+      "claude-opus-4-6",
+      () => {},
+      "main_agent",
+    );
+
+    expect(updateConversationUsageCalls).toHaveLength(1);
+    const call = updateConversationUsageCalls[0];
+    expect(call.inputTokens).toBe(0);
+    expect(call.outputTokens).toBe(15);
+    expect(Number.isFinite(call.estimatedCost)).toBe(true);
+  });
+});

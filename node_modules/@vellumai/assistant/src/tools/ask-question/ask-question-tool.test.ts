@@ -1,0 +1,827 @@
+import { beforeEach, describe, expect, mock, test } from "bun:test";
+
+import type {
+  QuestionPromptOutcome,
+  QuestionPromptParams,
+  QuestionPromptResult,
+} from "../../permissions/question-prompter.js";
+import type { ToolContext } from "../types.js";
+
+// Stub the prompter at the module level. The tool instantiates
+// `new QuestionPrompter(...)` inside `execute()`, so every call goes
+// through this constructor — we record `prompt()` calls into a shared
+// `calls` array and rotate `nextResult` per test via `setNextResult`.
+//
+// `mock.module` is hoisted by bun before any static import of the tool
+// runs, so the import below sees the stubbed prompter even though
+// `askQuestionTool` captures the symbol at module-eval time.
+const calls: QuestionPromptParams[] = [];
+let nextResult: QuestionPromptResult = {
+  entries: [{ questionId: "q1", decision: "skipped" }],
+  overall: "completed",
+};
+function setNextResult(result: QuestionPromptResult): void {
+  nextResult = result;
+}
+
+mock.module("../../permissions/question-prompter.js", () => ({
+  QuestionPrompter: class {
+    async prompt(params: QuestionPromptParams): Promise<QuestionPromptOutcome> {
+      calls.push(params);
+      // Mirror the real prompter: it mints the request id and assigns the
+      // per-question `q1..qN` ids, then returns them alongside the resolution.
+      return {
+        requestId: "req-stub",
+        questions: params.questions.map((q, i) => ({ id: `q${i + 1}`, ...q })),
+        ...nextResult,
+      };
+    }
+  },
+}));
+
+// Import after the mock so the tool's `import { QuestionPrompter }` binds
+// to the stub class above.
+const { askQuestionTool, formatQuestionsAsTextFallback, toAnsweredQuestion } =
+  await import("./ask-question-tool.js");
+
+type PromptParams = QuestionPromptParams;
+
+function makeContext(overrides: Partial<ToolContext> = {}): ToolContext {
+  return {
+    workingDir: "/tmp",
+    conversationId: "conv-1",
+    trustClass: "guardian",
+    toolUseId: "tu-1",
+    ...overrides,
+  };
+}
+
+// Reset call log + default result between tests so individual cases stay
+// hermetic. Each test that needs a non-default result calls
+// `setNextResult()` before invoking `askQuestionTool.execute(...)`.
+beforeEach(() => {
+  calls.length = 0;
+  nextResult = {
+    entries: [{ questionId: "q1", decision: "skipped" }],
+    overall: "completed",
+  };
+});
+
+// A single question used to build batches. The tool only accepts the
+// batched `{ questions: [...] }` shape.
+const singleQ = {
+  question: "Which fruit?",
+  description: "Pick one to add to the smoothie.",
+  options: [
+    { id: "a", label: "Apple" },
+    { id: "b", label: "Banana", description: "Ripe" },
+  ],
+  freeTextPlaceholder: "Type a fruit",
+};
+
+const validInput = { questions: [singleQ] };
+
+describe("askQuestionTool definition", () => {
+  test("exposes the expected schema shape and description language", () => {
+    const def = askQuestionTool;
+    expect(def.name).toBe("ask_question");
+    expect(def.description).toContain("free-text fallback is always added");
+    expect(def.description).toContain("do not");
+    expect(def.description).toContain("'something else'");
+    expect(def.description).toContain("plain-text clarification");
+    expect(def.description).toContain("obvious from context");
+    expect(def.description).toContain("Use this tool whenever");
+    expect(def.description).toContain("When in doubt");
+    expect(def.description).toContain("plausible interpretations");
+    expect(def.description).toContain("remove guessing");
+    expect(def.description).toContain("a question is skipped");
+    expect(def.description).toContain("every question in the batch is skipped");
+    expect(def.description).toContain("Batch related clarifications");
+    expect(def.description).toContain("up to 5");
+    expect(def.description).toContain("Skip button");
+
+    const schema = def.input_schema as {
+      properties: Record<
+        string,
+        {
+          type?: string;
+          items?: {
+            properties?: Record<
+              string,
+              { type?: string; minItems?: number; maxItems?: number }
+            >;
+          };
+        }
+      >;
+      required?: string[];
+    };
+    const optionsSchema =
+      schema.properties.questions?.items?.properties?.options;
+    expect(optionsSchema?.type).toBe("array");
+    expect(optionsSchema?.minItems).toBe(2);
+    expect(optionsSchema?.maxItems).toBe(4);
+  });
+});
+
+// Build a single-question completed result for tests that just need to
+// exercise the formatter on a one-element batch.
+function singleCompleted(
+  entry:
+    | { decision: "option"; optionId: string }
+    | { decision: "free_text"; text: string }
+    | { decision: "skipped" },
+): QuestionPromptResult {
+  return {
+    entries: [{ questionId: "q1", ...entry }],
+    overall: "completed",
+  };
+}
+
+describe("AskQuestionTool.execute", () => {
+  test("forwards questions array unchanged to the prompter", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+
+    const result = await askQuestionTool.execute(validInput, makeContext());
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.conversationId).toBe("conv-1");
+    expect(calls[0]?.questions).toHaveLength(1);
+    expect(calls[0]?.questions[0]?.question).toBe(singleQ.question);
+    expect(calls[0]?.questions[0]?.description).toBe(singleQ.description);
+    expect(calls[0]?.questions[0]?.options).toEqual(singleQ.options);
+    expect(calls[0]?.questions[0]?.freeTextPlaceholder).toBe(
+      singleQ.freeTextPlaceholder,
+    );
+    expect(calls[0]?.toolUseId).toBe("tu-1");
+
+    expect(result.isError).toBe(false);
+    expect(result.content).toBe(
+      `Question "${singleQ.question}" → Option: a (Apple)`,
+    );
+  });
+
+  test("formats option result with looked-up label", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "b" }));
+    const result = await askQuestionTool.execute(validInput, makeContext());
+    expect(result.content).toBe(
+      `Question "${singleQ.question}" → Option: b (Banana)`,
+    );
+    expect(result.isError).toBe(false);
+  });
+
+  test("falls back to '(unknown)' label when optionId is not in options", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "ghost" }));
+    const result = await askQuestionTool.execute(validInput, makeContext());
+    expect(result.content).toBe(
+      `Question "${singleQ.question}" → Option: ghost ((unknown))`,
+    );
+    expect(result.isError).toBe(false);
+  });
+
+  test("formats free-text result", async () => {
+    setNextResult(singleCompleted({ decision: "free_text", text: "Cherry" }));
+    const result = await askQuestionTool.execute(validInput, makeContext());
+    expect(result.content).toBe(
+      `Question "${singleQ.question}" → Free text: Cherry`,
+    );
+    expect(result.isError).toBe(false);
+  });
+
+  test("formats skipped result", async () => {
+    setNextResult(singleCompleted({ decision: "skipped" }));
+    const result = await askQuestionTool.execute(validInput, makeContext());
+    expect(result.content).toBe(`Question "${singleQ.question}" → Skipped`);
+    expect(result.isError).toBe(false);
+  });
+
+  test("timeout produces tool error", async () => {
+    setNextResult({
+      entries: [{ questionId: "q1", decision: "timed_out" }],
+      overall: "timed_out",
+    });
+    const result = await askQuestionTool.execute(validInput, makeContext());
+    expect(result.isError).toBe(true);
+    expect(result.content).toBe("User did not respond within timeout");
+  });
+
+  test("aborted produces tool error", async () => {
+    setNextResult({
+      entries: [{ questionId: "q1", decision: "skipped" }],
+      overall: "aborted",
+    });
+    const result = await askQuestionTool.execute(validInput, makeContext());
+    expect(result.isError).toBe(true);
+    expect(result.content).toBe("Question aborted");
+  });
+
+  test("short-circuits without prompting when no interactive user is present", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+
+    const result = await askQuestionTool.execute(
+      validInput,
+      makeContext({ isInteractive: false }),
+    );
+
+    // The prompter must never be invoked — there is no one to answer, so the
+    // turn proceeds with defaults instead of parking on the response backstop.
+    expect(calls).toHaveLength(0);
+    expect(result.isError).toBe(false);
+    expect(result.content.toLowerCase()).toContain("no interactive user");
+  });
+
+  test("still prompts when isInteractive is true or unset", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+
+    // The short-circuit keys off an explicit `false`, not a missing flag, so an
+    // interactive turn (or one that never set the flag) still prompts.
+    await askQuestionTool.execute(
+      validInput,
+      makeContext({ isInteractive: true }),
+    );
+    await askQuestionTool.execute(validInput, makeContext());
+
+    expect(calls).toHaveLength(2);
+  });
+
+  test("rejects a question with fewer than 2 options", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+    const result = await askQuestionTool.execute(
+      { questions: [{ ...singleQ, options: [{ id: "a", label: "Apple" }] }] },
+      makeContext(),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content.toLowerCase()).toContain("invalid input");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("rejects a question with more than 4 options", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+    const result = await askQuestionTool.execute(
+      {
+        questions: [
+          {
+            ...singleQ,
+            options: [
+              { id: "a", label: "A" },
+              { id: "b", label: "B" },
+              { id: "c", label: "C" },
+              { id: "d", label: "D" },
+              { id: "e", label: "E" },
+            ],
+          },
+        ],
+      },
+      makeContext(),
+    );
+    expect(result.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("rejects a question with empty text", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+    const result = await askQuestionTool.execute(
+      { questions: [{ ...singleQ, question: "" }] },
+      makeContext(),
+    );
+    expect(result.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("propagates abort signal into the prompter", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+    const ac = new AbortController();
+    await askQuestionTool.execute(
+      validInput,
+      makeContext({ signal: ac.signal }),
+    );
+    expect(calls[0]?.signal).toBe(ac.signal);
+  });
+});
+
+// ── Text fallback on channels without dynamic UI ────────────────────
+
+describe("AskQuestionTool text fallback (supportsDynamicUi === false)", () => {
+  test("returns a formatted text block without ever prompting", async () => {
+    const result = await askQuestionTool.execute(
+      validInput,
+      makeContext({ supportsDynamicUi: false }),
+    );
+
+    // The channel can't render the interactive card, so the prompter must
+    // never be invoked — broadcasting a question_request would reach app
+    // clients but never the channel the turn came from. Instead the model gets
+    // text to relay in its reply, which IS what reaches the channel.
+    expect(calls).toHaveLength(0);
+    expect(result.isError).toBe(false);
+    // Carries the question, both option labels, the option description, and an
+    // instruction to present the question as plain text.
+    expect(result.content).toContain(singleQ.question);
+    expect(result.content).toContain("Apple");
+    expect(result.content).toContain("Banana");
+    expect(result.content).toContain("Ripe");
+    expect(result.content).toContain("Options:");
+    expect(result.content.toLowerCase()).toContain("plain-text");
+  });
+
+  test("still prompts when supportsDynamicUi is true or unset", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+
+    // The fallback keys off an explicit `false`; a dynamic-UI channel (true)
+    // and a client that never set the flag (unset) both take the card path.
+    await askQuestionTool.execute(
+      validInput,
+      makeContext({ supportsDynamicUi: true }),
+    );
+    await askQuestionTool.execute(validInput, makeContext());
+
+    expect(calls).toHaveLength(2);
+  });
+
+  test("isInteractive:false short-circuits before the text fallback", async () => {
+    const result = await askQuestionTool.execute(
+      validInput,
+      makeContext({ isInteractive: false, supportsDynamicUi: false }),
+    );
+
+    // No interactive user present wins over the channel fallback: there is no
+    // one to answer at all, so proceed with defaults rather than emitting a
+    // question the turn would never get a reply to.
+    expect(calls).toHaveLength(0);
+    expect(result.content.toLowerCase()).toContain("no interactive user");
+  });
+
+  test("parks a single guardian question on a card-capable channel", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+
+    // A guardian's single-question turn on a channel with a card-rendering
+    // notification adapter parks on the prompter: the guardian-request
+    // pipeline delivers it as a tappable card, so falling back to text would
+    // regress it to an untappable message.
+    await askQuestionTool.execute(
+      validInput,
+      makeContext({
+        supportsDynamicUi: false,
+        supportsGuardianQuestionCards: true,
+        trustClass: "guardian",
+      }),
+    );
+
+    expect(calls).toHaveLength(1);
+  });
+
+  test("text fallback when the channel has no question-card delivery", async () => {
+    const result = await askQuestionTool.execute(
+      validInput,
+      makeContext({
+        supportsDynamicUi: false,
+        supportsGuardianQuestionCards: false,
+        trustClass: "guardian",
+      }),
+    );
+
+    expect(calls).toHaveLength(0);
+    expect(result.content.toLowerCase()).toContain("plain-text");
+  });
+
+  test("text fallback for a non-guardian channel turn even with card delivery", async () => {
+    // The pipeline delivers cards to the guardian; a non-guardian chatter
+    // would never see one, so their turn degrades to text.
+    const result = await askQuestionTool.execute(
+      validInput,
+      makeContext({
+        supportsDynamicUi: false,
+        supportsGuardianQuestionCards: true,
+        trustClass: "trusted_contact",
+      }),
+    );
+
+    expect(calls).toHaveLength(0);
+    expect(result.content.toLowerCase()).toContain("plain-text");
+  });
+
+  test("text fallback for a multi-question batch on a channel", async () => {
+    // One card carries one answer; multi-question batches stay text on
+    // channels (the app card still handles them when dynamic UI is present).
+    const result = await askQuestionTool.execute(
+      { questions: [singleQ, { ...singleQ, question: "Which size?" }] },
+      makeContext({
+        supportsDynamicUi: false,
+        supportsGuardianQuestionCards: true,
+        trustClass: "guardian",
+      }),
+    );
+
+    expect(calls).toHaveLength(0);
+    expect(result.content.toLowerCase()).toContain("plain-text");
+  });
+});
+
+describe("formatQuestionsAsTextFallback", () => {
+  test("renders a single question with un-numbered options by label", () => {
+    const text = formatQuestionsAsTextFallback([singleQ]);
+
+    expect(text).toContain("Question: Which fruit?");
+    expect(text).toContain("Pick one to add to the smoothie.");
+    expect(text).toContain("Options:");
+    expect(text).toContain("- Apple");
+    expect(text).toContain("- Banana — Ripe");
+    // A single question is not numbered.
+    expect(text).not.toContain("Question 1:");
+  });
+
+  test("numbers questions in a multi-question batch", () => {
+    const q2 = {
+      question: "Preferred time?",
+      options: [
+        { id: "morning", label: "Morning" },
+        { id: "afternoon", label: "Afternoon" },
+      ],
+    };
+
+    const text = formatQuestionsAsTextFallback([singleQ, q2]);
+
+    expect(text).toContain("2 questions");
+    expect(text).toContain("Question 1: Which fruit?");
+    expect(text).toContain("Question 2: Preferred time?");
+    expect(text).toContain("- Morning");
+    expect(text).toContain("- Afternoon");
+  });
+});
+
+// ── Batched input ───────────────────────────────────────────────────
+
+describe("AskQuestionTool batched input", () => {
+  test("accepts a single-element `questions` batch", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+
+    const result = await askQuestionTool.execute(
+      { questions: [singleQ] },
+      makeContext(),
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.questions).toHaveLength(1);
+    expect(calls[0]?.questions[0]?.question).toBe(singleQ.question);
+    expect(calls[0]?.questions[0]?.options).toEqual(singleQ.options);
+    expect(calls[0]?.questions[0]?.description).toBe(singleQ.description);
+    expect(calls[0]?.questions[0]?.freeTextPlaceholder).toBe(
+      singleQ.freeTextPlaceholder,
+    );
+    expect(result.isError).toBe(false);
+  });
+
+  test("forwards the full questions array for a multi-question batch", async () => {
+    const q2 = {
+      question: "Preferred time?",
+      options: [
+        { id: "morning", label: "Morning" },
+        { id: "afternoon", label: "Afternoon" },
+      ],
+      freeTextPlaceholder: "or specify",
+    };
+    const q3 = {
+      question: "Send invite?",
+      options: [
+        { id: "yes", label: "Yes" },
+        { id: "no", label: "No" },
+      ],
+    };
+
+    setNextResult({
+      entries: [
+        { questionId: "q1", decision: "option", optionId: "a" },
+        { questionId: "q2", decision: "free_text", text: "noon-ish" },
+        { questionId: "q3", decision: "option", optionId: "yes" },
+      ],
+      overall: "completed",
+    });
+
+    const result = await askQuestionTool.execute(
+      { questions: [singleQ, q2, q3] },
+      makeContext(),
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.questions).toHaveLength(3);
+    expect(
+      calls[0]?.questions.map(
+        (q: PromptParams["questions"][number]) => q.question,
+      ),
+    ).toEqual([singleQ.question, q2.question, q3.question]);
+
+    expect(result.isError).toBe(false);
+    expect(result.content).toBe(
+      [
+        `Question "${singleQ.question}" → Option: a (Apple)`,
+        `Question "${q2.question}" → Free text: noon-ish`,
+        `Question "${q3.question}" → Option: yes (Yes)`,
+      ].join("\n"),
+    );
+  });
+
+  test("formats all-skipped batch as a non-error transcript", async () => {
+    const q2 = {
+      question: "Preferred time?",
+      options: [
+        { id: "morning", label: "Morning" },
+        { id: "afternoon", label: "Afternoon" },
+      ],
+    };
+    const q3 = {
+      question: "Send invite?",
+      options: [
+        { id: "yes", label: "Yes" },
+        { id: "no", label: "No" },
+      ],
+    };
+    setNextResult({
+      entries: [
+        { questionId: "q1", decision: "skipped" },
+        { questionId: "q2", decision: "skipped" },
+        { questionId: "q3", decision: "skipped" },
+      ],
+      overall: "completed",
+    });
+
+    const result = await askQuestionTool.execute(
+      { questions: [singleQ, q2, q3] },
+      makeContext(),
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.content).toBe(
+      [
+        `Question "${singleQ.question}" → Skipped`,
+        `Question "${q2.question}" → Skipped`,
+        `Question "${q3.question}" → Skipped`,
+      ].join("\n"),
+    );
+  });
+
+  test("closed batch prepends a summary line and remains non-error", async () => {
+    const q2 = {
+      question: "Preferred time?",
+      options: [
+        { id: "morning", label: "Morning" },
+        { id: "afternoon", label: "Afternoon" },
+      ],
+    };
+    setNextResult({
+      entries: [
+        { questionId: "q1", decision: "skipped" },
+        { questionId: "q2", decision: "skipped" },
+      ],
+      overall: "closed",
+    });
+
+    const result = await askQuestionTool.execute(
+      { questions: [singleQ, q2] },
+      makeContext(),
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.content).toBe(
+      [
+        "User closed the question card without answering. All questions skipped.",
+        `Question "${singleQ.question}" → Skipped`,
+        `Question "${q2.question}" → Skipped`,
+      ].join("\n"),
+    );
+  });
+
+  test("accepts a 5-entry batch (max allowed)", async () => {
+    setNextResult({
+      entries: [
+        { questionId: "q1", decision: "skipped" },
+        { questionId: "q2", decision: "skipped" },
+        { questionId: "q3", decision: "skipped" },
+        { questionId: "q4", decision: "skipped" },
+        { questionId: "q5", decision: "skipped" },
+      ],
+      overall: "completed",
+    });
+    const five = [singleQ, singleQ, singleQ, singleQ, singleQ];
+
+    const result = await askQuestionTool.execute(
+      { questions: five },
+      makeContext(),
+    );
+
+    expect(result.isError).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.questions).toHaveLength(5);
+  });
+
+  test("rejects batches with 6+ questions", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+    const six = [singleQ, singleQ, singleQ, singleQ, singleQ, singleQ];
+
+    const result = await askQuestionTool.execute(
+      { questions: six },
+      makeContext(),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content.toLowerCase()).toContain("invalid input");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("rejects empty `questions` array", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+
+    const result = await askQuestionTool.execute(
+      { questions: [] },
+      makeContext(),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content.toLowerCase()).toContain("invalid input");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("rejects input missing `questions`", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+
+    const result = await askQuestionTool.execute({}, makeContext());
+
+    expect(result.isError).toBe(true);
+    expect(result.content.toLowerCase()).toContain("invalid input");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("rejects the dropped flat single-question shape", async () => {
+    setNextResult(singleCompleted({ decision: "option", optionId: "a" }));
+
+    const result = await askQuestionTool.execute(
+      {
+        question: "Hi?",
+        options: [
+          { id: "a", label: "A" },
+          { id: "b", label: "B" },
+        ],
+      },
+      makeContext(),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content.toLowerCase()).toContain("invalid input");
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("askQuestionTool definition (batched schema)", () => {
+  test("exposes `questions[]` shape, requires it, and drops the flat fields", () => {
+    const def = askQuestionTool;
+    const schema = def.input_schema as unknown as {
+      properties: Record<
+        string,
+        {
+          type?: string;
+          minItems?: number;
+          maxItems?: number;
+          items?: {
+            type?: string;
+            properties?: Record<string, unknown>;
+            required?: string[];
+          };
+        }
+      >;
+      required?: string[];
+    };
+
+    const questions = schema.properties.questions;
+    expect(questions?.type).toBe("array");
+    expect(questions?.minItems).toBe(1);
+    expect(questions?.maxItems).toBe(5);
+
+    const itemProps = questions?.items?.properties ?? {};
+    expect(Object.keys(itemProps)).toEqual(
+      expect.arrayContaining([
+        "question",
+        "description",
+        "options",
+        "freeTextPlaceholder",
+      ]),
+    );
+    // No per-question `id` field — daemon-assigned only.
+    expect(Object.keys(itemProps)).not.toContain("id");
+
+    expect(questions?.items?.required).toEqual(["question", "options"]);
+
+    // `questions` is the only top-level input now.
+    expect(schema.required).toEqual(["questions"]);
+    expect(Object.keys(schema.properties)).toEqual(["questions"]);
+
+    // The legacy flat fields are gone.
+    expect(schema.properties.question).toBeUndefined();
+    expect(schema.properties.options).toBeUndefined();
+  });
+});
+
+describe("answered-question record", () => {
+  test("carries the option the user chose, keyed to the questions as asked", async () => {
+    setNextResult({
+      entries: [{ questionId: "q1", decision: "option", optionId: "b" }],
+      overall: "completed",
+    });
+
+    const result = await askQuestionTool.execute(validInput, makeContext());
+
+    expect(result.answeredQuestion).toEqual({
+      requestId: "req-stub",
+      questions: [{ id: "q1", ...singleQ }],
+      responses: [{ questionId: "q1", decision: "option", optionId: "b" }],
+      overall: "completed",
+    });
+  });
+
+  test("carries a free-text answer", async () => {
+    setNextResult({
+      entries: [{ questionId: "q1", decision: "free_text", text: "Cherry" }],
+      overall: "completed",
+    });
+
+    const result = await askQuestionTool.execute(validInput, makeContext());
+
+    expect(result.answeredQuestion?.responses).toEqual([
+      { questionId: "q1", decision: "free_text", text: "Cherry" },
+    ]);
+  });
+
+  test("records a closed card as every question skipped", async () => {
+    setNextResult({
+      entries: [
+        { questionId: "q1", decision: "skipped" },
+        { questionId: "q2", decision: "skipped" },
+      ],
+      overall: "closed",
+    });
+
+    const result = await askQuestionTool.execute(
+      { questions: [singleQ, singleQ] },
+      makeContext(),
+    );
+
+    expect(result.answeredQuestion?.overall).toBe("closed");
+    expect(result.answeredQuestion?.responses).toEqual([
+      { questionId: "q1", decision: "skipped" },
+      { questionId: "q2", decision: "skipped" },
+    ]);
+  });
+
+  test("keeps per-question skips inside an otherwise completed batch", async () => {
+    setNextResult({
+      entries: [
+        { questionId: "q1", decision: "option", optionId: "a" },
+        { questionId: "q2", decision: "skipped" },
+      ],
+      overall: "completed",
+    });
+
+    const result = await askQuestionTool.execute(
+      { questions: [singleQ, singleQ] },
+      makeContext(),
+    );
+
+    expect(result.answeredQuestion?.responses).toEqual([
+      { questionId: "q1", decision: "option", optionId: "a" },
+      { questionId: "q2", decision: "skipped" },
+    ]);
+  });
+
+  test("records nothing for a prompt that timed out or was aborted", async () => {
+    for (const overall of ["timed_out", "aborted"] as const) {
+      setNextResult({
+        entries: [{ questionId: "q1", decision: overall }],
+        overall,
+      });
+
+      const result = await askQuestionTool.execute(validInput, makeContext());
+
+      expect(result.isError).toBe(true);
+      expect(result.answeredQuestion).toBeUndefined();
+    }
+  });
+
+  test("records nothing when the channel degrades to the text fallback", async () => {
+    const result = await askQuestionTool.execute(
+      validInput,
+      makeContext({ supportsDynamicUi: false }),
+    );
+
+    // No card was ever shown, so there is no answered state to keep.
+    expect(result.answeredQuestion).toBeUndefined();
+    expect(calls).toHaveLength(0);
+  });
+
+  test("toAnsweredQuestion is undefined for non-user outcomes", () => {
+    expect(
+      toAnsweredQuestion({
+        requestId: "req-1",
+        questions: [],
+        entries: [],
+        overall: "timed_out",
+      }),
+    ).toBeUndefined();
+  });
+});

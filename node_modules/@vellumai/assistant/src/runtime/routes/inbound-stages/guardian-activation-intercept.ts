@@ -1,0 +1,250 @@
+/**
+ * Guardian activation intercept stage: when a bare /start arrives on a
+ * Telegram channel with no existing guardian, auto-initiate a verification
+ * session so the first user can claim the channel as guardian.
+ *
+ * This runs BEFORE ACL enforcement — a bare /start from an unknown user
+ * would otherwise be rejected. When the user subsequently enters the
+ * 6-digit code, the existing verification intercept validates it, creates
+ * the guardian binding, and sends a success reply.
+ */
+import type { VerificationSessionWire } from "../../../channels/gateway-verification-sessions.js";
+import {
+  createOutboundSessionConditional,
+  findActiveSession,
+} from "../../../channels/gateway-verification-sessions.js";
+import type { ChannelId } from "../../../channels/types.js";
+import {
+  getGuardianDeliveryFresh,
+  guardianForChannel,
+} from "../../../contacts/guardian-delivery-reader.js";
+import { emitNotificationSignal } from "../../../notifications/emit-signal.js";
+import { getLogger } from "../../../util/logger.js";
+import { deliverChannelReply } from "../../gateway-client.js";
+
+const log = getLogger("runtime-http");
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+export interface GuardianActivationInterceptParams {
+  sourceChannel: ChannelId;
+  conversationExternalId: string;
+  rawSenderId: string | undefined;
+  canonicalSenderId: string | null;
+  actorDisplayName: string | undefined;
+  actorUsername: string | undefined;
+  sourceMetadata: import("@vellumai/gateway-client").SourceMetadata | undefined;
+  replyCallbackUrl: string | undefined;
+  assistantId: string;
+  externalMessageId: string;
+}
+
+/**
+ * Lightweight dedup set for guardian activation intercepts.
+ * Prevents duplicate replies when Telegram retries the same webhook.
+ * Entries are evicted after DEDUP_TTL_MS to avoid unbounded growth.
+ */
+const DEDUP_TTL_MS = 60_000;
+const processedMessageIds = new Map<string, number>();
+
+function isAlreadyProcessed(messageId: string): boolean {
+  const now = Date.now();
+  // Evict stale entries
+  for (const [key, ts] of processedMessageIds) {
+    if (now - ts > DEDUP_TTL_MS) {
+      processedMessageIds.delete(key);
+    }
+  }
+  return processedMessageIds.has(messageId);
+}
+
+function markProcessed(messageId: string): void {
+  processedMessageIds.set(messageId, Date.now());
+}
+
+export async function handleGuardianActivationIntercept(
+  params: GuardianActivationInterceptParams,
+): Promise<Record<string, unknown> | null> {
+  const {
+    sourceChannel,
+    conversationExternalId,
+    rawSenderId,
+    actorDisplayName,
+    actorUsername,
+    sourceMetadata,
+    replyCallbackUrl,
+    assistantId,
+    externalMessageId,
+  } = params;
+
+  // ── Extract commandIntent ──
+  const commandIntent = sourceMetadata?.commandIntent;
+
+  // Only proceed for /start commands
+  if (!commandIntent || commandIntent.type !== "start") {
+    return null;
+  }
+
+  // If /start has a payload (e.g. gv_token, iv_token), let the existing
+  // bootstrap/invite handlers deal with it.
+  if (commandIntent.payload && commandIntent.payload.length > 0) {
+    return null;
+  }
+
+  // Only proceed for Telegram (can be extended later)
+  if (sourceChannel !== "telegram") {
+    return null;
+  }
+
+  // If a guardian already exists for this channel, continue to normal flow.
+  // Null-list (gateway unreachable) is treated as guardian-present so a
+  // transient miss does NOT spuriously auto-start verification.
+  // Read fresh: gateway-side binding writes don't invalidate the daemon cache.
+  const guardianList = await getGuardianDeliveryFresh({
+    channelTypes: [sourceChannel],
+  });
+  if (
+    guardianList === null ||
+    guardianForChannel(guardianList, sourceChannel)
+  ) {
+    return null;
+  }
+
+  // Can't bind a session without sender identity
+  if (!rawSenderId) {
+    return null;
+  }
+
+  // ── Webhook retry dedup ──
+  // The intercept runs before recordInbound, so use a lightweight in-memory
+  // dedup to prevent duplicate replies when Telegram retries the webhook.
+  // Only checked here; marked as processed after successful session creation
+  // so transient failures remain retryable.
+  if (isAlreadyProcessed(externalMessageId)) {
+    return { accepted: true, guardianActivation: true };
+  }
+
+  // ── Idempotency: check for an existing active session from this sender ──
+  // Sessions live in the gateway. Inbound messages arrive through the
+  // gateway, so an unreachable gateway here is a narrow race, not a steady
+  // state: skip auto-activation (creating would fail anyway) and let the
+  // normal pipeline handle the message.
+  let existingSession: VerificationSessionWire | null;
+  try {
+    // This sender's own session. The channel may carry others, and what the
+    // guard below needs to know is whether THIS activation is a duplicate.
+    existingSession = await findActiveSession(sourceChannel, {
+      expectedExternalUserId: rawSenderId,
+    });
+  } catch (err) {
+    log.warn(
+      { err, sourceChannel },
+      "Guardian activation: session read failed (gateway unreachable), skipping auto-activation",
+    );
+    return null;
+  }
+  const respondActivationPending = (): Record<string, unknown> => {
+    if (replyCallbackUrl) {
+      deliverChannelReply(replyCallbackUrl, {
+        chatId: conversationExternalId,
+        text: "A verification is already in progress. Check your assistant app for the code and enter it here.",
+        assistantId,
+      }).catch((err) => {
+        log.error(
+          { err, sourceChannel, conversationExternalId },
+          "Failed to deliver guardian activation idempotency reply",
+        );
+      });
+    }
+    markProcessed(externalMessageId);
+    return { accepted: true, guardianActivationPending: true };
+  };
+
+  // The read is scoped to this sender, so anything it returned is this
+  // sender's own activation already in flight.
+  if (existingSession) {
+    return respondActivationPending();
+  }
+
+  // ── Create verification session ──
+  // The read above saw no session for this sender, so the sender-scoped
+  // create-if-absent makes the mint atomic: a concurrent activation from the
+  // same sender that minted in between conflicts here instead of revoking that
+  // first code. Scoped to the sender rather than the channel, because another
+  // person verifying at the same time is ordinary and must not block this.
+  let sessionResult: Awaited<
+    ReturnType<typeof createOutboundSessionConditional>
+  >;
+  try {
+    sessionResult = await createOutboundSessionConditional({
+      channel: sourceChannel,
+      expectedExternalUserId: rawSenderId,
+      expectedChatId: conversationExternalId,
+      identityBindingStatus: "bound",
+      destinationAddress: conversationExternalId,
+      verificationPurpose: "guardian",
+      ifNoneActiveForExternalUserId: rawSenderId,
+    });
+  } catch (err) {
+    log.warn(
+      { err, sourceChannel },
+      "Guardian activation: session creation failed (gateway unreachable), skipping auto-activation",
+    );
+    return null;
+  }
+
+  if ("conflict" in sessionResult) {
+    // Lost the create race: a session was minted between the read and this
+    // create. Mirror the dedup path — the winner's code stays valid.
+    log.info(
+      { sourceChannel, reason: sessionResult.reason },
+      "Guardian activation: concurrent activation already created a session",
+    );
+    return respondActivationPending();
+  }
+
+  // Mark as processed only after session creation succeeds so transient
+  // failures (e.g. gateway unreachable) remain retryable on the next webhook.
+  markProcessed(externalMessageId);
+
+  // ── Send deterministic Telegram reply ──
+  if (replyCallbackUrl) {
+    deliverChannelReply(replyCallbackUrl, {
+      chatId: conversationExternalId,
+      text: "Welcome! To verify your identity as guardian, check your assistant app for a verification code and enter it here.",
+      assistantId,
+    }).catch((err) => {
+      log.error(
+        { err, sourceChannel, conversationExternalId },
+        "Failed to deliver guardian activation welcome reply",
+      );
+    });
+  }
+
+  // ── Emit notification signal to deliver code to macOS app ──
+  void emitNotificationSignal({
+    sourceEventName: "guardian.channel_activation",
+    sourceChannel,
+    sourceContextId: `guardian-activation-${sourceChannel}-${rawSenderId}`,
+    attentionHints: {
+      requiresAction: true,
+      urgency: "high",
+      isAsyncBackground: false,
+      visibleInSourceNow: false,
+    },
+    contextPayload: {
+      verificationCode: sessionResult.secret,
+      sourceChannel,
+      actorExternalId: rawSenderId,
+      actorDisplayName: actorDisplayName ?? null,
+      actorUsername: actorUsername ?? null,
+      sessionId: sessionResult.sessionId,
+      expiresAt: sessionResult.expiresAt,
+    },
+    dedupeKey: `guardian-activation:${sessionResult.sessionId}`,
+  });
+
+  return { accepted: true, guardianActivation: true };
+}

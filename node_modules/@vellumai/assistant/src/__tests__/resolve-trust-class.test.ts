@@ -1,0 +1,74 @@
+import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+
+// ── Module mocks ─────────────────────────────────────────────────────
+
+let fakeHttpAuthDisabled = false;
+
+mock.module("../config/env.js", () => ({
+  isHttpAuthDisabled: () => fakeHttpAuthDisabled,
+  hasUngatedHttpAuthDisabled: () => false,
+}));
+
+// ── Real imports (after mocks) ───────────────────────────────────────
+
+import {
+  FALLBACK_TURN_TRUST,
+  resolveTrustClass,
+} from "../daemon/trust-context.js";
+import type { TrustContext } from "../daemon/trust-context-types.js";
+
+afterAll(() => {
+  mock.restore();
+});
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+describe("resolveTrustClass", () => {
+  beforeEach(() => {
+    fakeHttpAuthDisabled = false;
+  });
+
+  test("returns guardian context trust class when auth is enabled", () => {
+    const ctx: Pick<TrustContext, "trustClass"> = {
+      trustClass: "trusted_contact",
+    };
+    expect(resolveTrustClass(ctx as TrustContext)).toBe("trusted_contact");
+  });
+
+  test("returns 'unknown' when trustContext is undefined", () => {
+    expect(resolveTrustClass(undefined)).toBe("unknown");
+  });
+
+  test("does not elevate a resolved non-guardian actor when HTTP auth is disabled", () => {
+    // DISABLE_HTTP_AUTH is the standing config in platform-managed deployments,
+    // so a resolved channel actor's class must survive it — otherwise a
+    // non-guardian Slack/phone contact would be treated as the guardian
+    // (LUM-2669). Only an unresolved (local/native) turn is elevated; see below.
+    fakeHttpAuthDisabled = true;
+    expect(
+      resolveTrustClass({ trustClass: "trusted_contact" } as TrustContext),
+    ).toBe("trusted_contact");
+    expect(resolveTrustClass({ trustClass: "unknown" } as TrustContext)).toBe(
+      "unknown",
+    );
+  });
+
+  test("treats an unresolved (local/native) turn as guardian when HTTP auth is disabled", () => {
+    // Local/native turns reach the daemon without a channel-resolved
+    // trustContext; in an auth-disabled (local) deployment that actor is the
+    // guardian, so control-plane gates don't block local development.
+    fakeHttpAuthDisabled = true;
+    expect(resolveTrustClass(undefined)).toBe("guardian");
+  });
+
+  test("does not elevate the FALLBACK_TURN_TRUST snapshot to guardian when HTTP auth is disabled", () => {
+    // conversation-tool-setup substitutes FALLBACK_TURN_TRUST (a *present*,
+    // unknown-class context) when no per-turn snapshot has been captured. Because
+    // it is a resolved context -- not `undefined` -- the dev-bypass must not
+    // elevate it: the fallback's documented bias-to-unknown has to survive
+    // DISABLE_HTTP_AUTH so a missing snapshot can't grant guardian trust. This is
+    // the fail-safe sibling to LUM-2665; see LUM-2669.
+    fakeHttpAuthDisabled = true;
+    expect(resolveTrustClass(FALLBACK_TURN_TRUST)).toBe("unknown");
+  });
+});

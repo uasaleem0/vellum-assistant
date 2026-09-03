@@ -1,0 +1,343 @@
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+
+import type { BatchTranscriber } from "../../../stt/types.js";
+import { SttError } from "../../../stt/types.js";
+
+// ---------------------------------------------------------------------------
+// Mocks — must be set up before importing the module under test
+// ---------------------------------------------------------------------------
+
+let mockAttachments: Array<{
+  id: string;
+  mimeType: string;
+  dataBase64: string;
+  originalFilename: string;
+  sizeBytes: number;
+  kind: string;
+  thumbnailBase64: string | null;
+  createdAt: number;
+}> = [];
+let mockTranscriber: BatchTranscriber | null = null;
+
+mock.module("../../../persistence/attachments-store.js", () => ({
+  getAttachmentsByIds: (ids: string[]) =>
+    mockAttachments.filter((a) => ids.includes(a.id)),
+  getAttachmentById: (id: string, _opts?: { hydrateFileData?: boolean }) =>
+    mockAttachments.find((a) => a.id === id) ?? null,
+}));
+
+mock.module("../../../providers/speech-to-text/resolve.js", () => ({
+  resolveBatchTranscriber: async () => mockTranscriber,
+}));
+
+mock.module("../../../stt/daemon-batch-transcriber.js", () => ({
+  normalizeSttError: (err: unknown): SttError => {
+    if (err instanceof SttError) {
+      return err;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof Error && err.name === "AbortError") {
+      return new SttError("timeout", message);
+    }
+    return new SttError("provider-error", message);
+  },
+}));
+
+// Import after mocks are installed
+const { tryTranscribeAudioAttachments } = await import("./transcribe-audio.js");
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makeAudioAttachment(
+  id: string,
+  mimeType = "audio/ogg",
+  dataBase64 = Buffer.from("fake-audio-data").toString("base64"),
+) {
+  return {
+    id,
+    mimeType,
+    dataBase64,
+    originalFilename: `voice-${id}.ogg`,
+    sizeBytes: Buffer.from(dataBase64, "base64").length,
+    kind: "document" as const,
+    thumbnailBase64: null,
+    createdAt: Date.now(),
+  };
+}
+
+function makeDocumentAttachment(id: string) {
+  return {
+    id,
+    mimeType: "application/pdf",
+    dataBase64: Buffer.from("fake-pdf").toString("base64"),
+    originalFilename: `doc-${id}.pdf`,
+    sizeBytes: 8,
+    kind: "document" as const,
+    thumbnailBase64: null,
+    createdAt: Date.now(),
+  };
+}
+
+function makeImageAttachment(id: string) {
+  return {
+    id,
+    mimeType: "image/png",
+    dataBase64: Buffer.from("fake-image").toString("base64"),
+    originalFilename: `photo-${id}.png`,
+    sizeBytes: 10,
+    kind: "image" as const,
+    thumbnailBase64: null,
+    createdAt: Date.now(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe("tryTranscribeAudioAttachments", () => {
+  beforeEach(() => {
+    mockAttachments = [];
+    mockTranscriber = null;
+  });
+
+  afterEach(() => {
+    mockAttachments = [];
+  });
+
+  test("audio attachment is transcribed and returns transcribed result", async () => {
+    const audio = makeAudioAttachment("a1");
+    mockAttachments = [audio];
+    mockTranscriber = {
+      providerId: "openai-whisper",
+      boundaryId: "daemon-batch",
+      transcribe: async () => ({ text: "Hello, how are you?" }),
+    };
+
+    const result = await tryTranscribeAudioAttachments(["a1"]);
+
+    expect(result).toEqual({
+      status: "transcribed",
+      text: "Hello, how are you?",
+    });
+  });
+
+  test("non-audio attachments return no_audio", async () => {
+    const doc = makeDocumentAttachment("d1");
+    const img = makeImageAttachment("i1");
+    mockAttachments = [doc, img];
+    mockTranscriber = {
+      providerId: "openai-whisper",
+      boundaryId: "daemon-batch",
+      transcribe: async () => ({ text: "should not be called" }),
+    };
+
+    const result = await tryTranscribeAudioAttachments(["d1", "i1"]);
+
+    expect(result).toEqual({ status: "no_audio" });
+  });
+
+  test("no provider returns no_provider with service-agnostic reason", async () => {
+    const audio = makeAudioAttachment("a1");
+    mockAttachments = [audio];
+    mockTranscriber = null; // No transcriber resolved
+
+    const result = await tryTranscribeAudioAttachments(["a1"]);
+
+    expect(result.status).toBe("no_provider");
+    const reason = (result as { reason: string }).reason;
+    expect(reason).toContain("speech-to-text");
+    expect(reason).toContain("voice message transcription");
+    expect(reason).not.toContain("OpenAI");
+  });
+
+  test("API failure returns a friendly, non-raw reason naming the provider", async () => {
+    const audio = makeAudioAttachment("a1");
+    mockAttachments = [audio];
+    mockTranscriber = {
+      providerId: "openai-whisper",
+      boundaryId: "daemon-batch",
+      transcribe: async () => {
+        throw new Error("API rate limit exceeded");
+      },
+    };
+
+    const result = await tryTranscribeAudioAttachments(["a1"]);
+
+    expect(result.status).toBe("error");
+    const reason = (result as { reason: string }).reason;
+    // Friendly copy replaces the raw provider string.
+    expect(reason).not.toContain("API rate limit exceeded");
+    expect(reason).toContain("OpenAI Whisper");
+  });
+
+  test("auth failure returns a friendly, JSON-free reason that names the API key", async () => {
+    const audio = makeAudioAttachment("a1");
+    mockAttachments = [audio];
+    mockTranscriber = {
+      providerId: "deepgram",
+      boundaryId: "daemon-batch",
+      transcribe: async () => {
+        // Mocked normalizeSttError returns an SttError as-is, so throw the
+        // categorized error directly (a plain 401 string would classify as
+        // provider-error under the simplified mock).
+        throw new SttError(
+          "auth",
+          'Deepgram API error (401): {"err_code":"INVALID_AUTH"}',
+        );
+      },
+    };
+
+    const result = await tryTranscribeAudioAttachments(["a1"]);
+
+    expect(result.status).toBe("error");
+    const reason = (result as { reason: string }).reason;
+    expect(reason).not.toContain("{");
+    expect(reason).not.toContain("INVALID_AUTH");
+    expect(reason).toContain("API key");
+    expect(reason).toContain("Deepgram");
+  });
+
+  test("managed auth failure surfaces its remediation, not the BYOK API-key rewrite", async () => {
+    const audio = makeAudioAttachment("a1");
+    mockAttachments = [audio];
+    const managedMessage =
+      "Managed speech needs a working Vellum platform connection — reconnect with 'assistant platform connect'.";
+    mockTranscriber = {
+      providerId: "vellum",
+      boundaryId: "daemon-batch",
+      transcribe: async () => {
+        // Managed adapters flag their SttError userFacing so the friendly
+        // copy layer passes the message through verbatim.
+        throw new SttError("auth", managedMessage, { userFacing: true });
+      },
+    };
+
+    const result = await tryTranscribeAudioAttachments(["a1"]);
+
+    expect(result.status).toBe("error");
+    const reason = (result as { reason: string }).reason;
+    expect(reason).toBe(managedMessage);
+    // Managed users have no STT key — the BYOK rewrite must not appear.
+    expect(reason).not.toContain("API key");
+    expect(reason).not.toContain("Settings → Voice");
+  });
+
+  test("managed credits-exhausted failure is not hidden behind generic copy", async () => {
+    const audio = makeAudioAttachment("a1");
+    mockAttachments = [audio];
+    const creditsMessage =
+      "Vellum credits are exhausted — add funds to your Vellum account to continue using managed transcription.";
+    mockTranscriber = {
+      providerId: "vellum",
+      boundaryId: "daemon-batch",
+      transcribe: async () => {
+        throw new SttError("provider-error", creditsMessage, {
+          userFacing: true,
+        });
+      },
+    };
+
+    const result = await tryTranscribeAudioAttachments(["a1"]);
+
+    expect(result.status).toBe("error");
+    const reason = (result as { reason: string }).reason;
+    expect(reason).toBe(creditsMessage);
+    expect(reason).not.toContain("returned an error while transcribing");
+  });
+
+  test("30-second timeout fires and returns error without blocking", async () => {
+    const audio = makeAudioAttachment("a1");
+    mockAttachments = [audio];
+    mockTranscriber = {
+      providerId: "openai-whisper",
+      boundaryId: "daemon-batch",
+      transcribe: async () => {
+        throw new DOMException("The operation was aborted", "AbortError");
+      },
+    };
+
+    const result = await tryTranscribeAudioAttachments(["a1"]);
+
+    expect(result.status).toBe("error");
+    expect((result as { reason: string }).reason).toContain(
+      "Transcription timed out",
+    );
+  });
+
+  test("multiple audio attachments are transcribed and concatenated", async () => {
+    const a1 = makeAudioAttachment("a1");
+    const a2 = makeAudioAttachment("a2", "audio/mpeg");
+    mockAttachments = [a1, a2];
+
+    let callCount = 0;
+    mockTranscriber = {
+      providerId: "openai-whisper",
+      boundaryId: "daemon-batch",
+      transcribe: async () => {
+        callCount++;
+        return { text: callCount === 1 ? "First message" : "Second message" };
+      },
+    };
+
+    const result = await tryTranscribeAudioAttachments(["a1", "a2"]);
+
+    expect(result).toEqual({
+      status: "transcribed",
+      text: "First message\n\nSecond message",
+    });
+    expect(callCount).toBe(2);
+  });
+
+  test("mixed audio and non-audio attachments: only audio is transcribed", async () => {
+    const audio = makeAudioAttachment("a1");
+    const doc = makeDocumentAttachment("d1");
+    mockAttachments = [audio, doc];
+
+    let transcribeCallCount = 0;
+    mockTranscriber = {
+      providerId: "openai-whisper",
+      boundaryId: "daemon-batch",
+      transcribe: async () => {
+        transcribeCallCount++;
+        return { text: "Voice transcription" };
+      },
+    };
+
+    const result = await tryTranscribeAudioAttachments(["a1", "d1"]);
+
+    expect(result).toEqual({
+      status: "transcribed",
+      text: "Voice transcription",
+    });
+    expect(transcribeCallCount).toBe(1);
+  });
+
+  test("empty attachment IDs returns no_audio", async () => {
+    mockTranscriber = {
+      providerId: "openai-whisper",
+      boundaryId: "daemon-batch",
+      transcribe: async () => ({ text: "should not be called" }),
+    };
+
+    const result = await tryTranscribeAudioAttachments([]);
+
+    expect(result).toEqual({ status: "no_audio" });
+  });
+
+  test("attachment with empty transcription returns no_audio", async () => {
+    const audio = makeAudioAttachment("a1");
+    mockAttachments = [audio];
+    mockTranscriber = {
+      providerId: "openai-whisper",
+      boundaryId: "daemon-batch",
+      transcribe: async () => ({ text: "   " }), // whitespace-only
+    };
+
+    const result = await tryTranscribeAudioAttachments(["a1"]);
+
+    expect(result).toEqual({ status: "no_audio" });
+  });
+});

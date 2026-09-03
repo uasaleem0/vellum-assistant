@@ -1,0 +1,2099 @@
+import { Cron } from "croner";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  lte,
+  sql,
+} from "drizzle-orm";
+import { v4 as uuid } from "uuid";
+
+import { getConversation } from "../persistence/conversation-crud.js";
+import { getDb } from "../persistence/db-connection.js";
+import { getGroup } from "../persistence/group-crud.js";
+import { isLifecycleQuiesced } from "../persistence/lifecycle-quiesce.js";
+import { rawChanges } from "../persistence/raw-query.js";
+import { scheduleJobs, scheduleRuns } from "../persistence/schema/index.js";
+import { publishSchedulesChanged } from "../runtime/sync/resource-sync-events.js";
+import { UserError } from "../util/errors.js";
+import { getLogger } from "../util/logger.js";
+import { withSqliteRetry } from "../util/sqlite-retry.js";
+import {
+  hasOwnerDeferProvenance,
+  isDeferSchedule,
+  LEGACY_DEFER_CREATED_BY,
+  OWNER_DEFER_CREATED_BY,
+} from "./defer-provenance.js";
+import {
+  resolveDefaultScheduleInferenceProfile,
+  resolveWakeScheduleInferenceProfile,
+} from "./inference-profile.js";
+import { declarationExistsOnDisk } from "./plugin-schedule-declarations.js";
+import {
+  computeNextRunAt as computeNextRunAtEngine,
+  isValidScheduleExpression,
+} from "./recurrence-engine.js";
+import type { ScheduleSyntax } from "./recurrence-types.js";
+import {
+  expressionCarriesOwnTimezone,
+  resolveScheduleTimezone,
+} from "./schedule-timezone.js";
+
+const logger = getLogger("schedule-store");
+
+function notifySchedulesChanged(): void {
+  publishSchedulesChanged();
+  void import("../background-wake/publisher.js")
+    .then(({ refreshBackgroundWakeIntent }) =>
+      refreshBackgroundWakeIntent("schedule-changed"),
+    )
+    .catch((err) =>
+      logger.warn({ err }, "Failed to queue background wake refresh"),
+    );
+}
+
+export type ScheduleMode =
+  | "notify"
+  | "execute"
+  | "script"
+  | "wake"
+  | "workflow";
+export type RoutingIntent = "single_channel" | "multi_channel" | "all_channels";
+export type ScheduleStatus = "active" | "firing" | "fired" | "cancelled";
+
+export interface ScheduleJob {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  syntax: ScheduleSyntax;
+  expression: string | null;
+  cronExpression: string | null;
+  timezone: string | null;
+  message: string;
+  script: string | null;
+  wakeConversationId: string | null;
+  /** Saved workflow to trigger; only used when mode = 'workflow'. */
+  workflowName: string | null;
+  /** Args passed verbatim to the workflow run; only used when mode = 'workflow'. */
+  workflowArgs: unknown;
+  /** Capability manifest scoping the schedule's run; null = unconstrained. */
+  capabilities: unknown | null;
+  nextRunAt: number;
+  lastRunAt: number | null;
+  lastStatus: string | null;
+  retryCount: number;
+  maxRetries: number;
+  retryBackoffMs: number;
+  /** Script-mode execution timeout override (ms); null = use the default. */
+  timeoutMs: number | null;
+  /**
+   * Inference profile (`llm.profiles` key) applied to the schedule's
+   * LLM-executed runs. Pinned at creation from the caller's choice or a
+   * snapshot of the resolved default, so the schedule's model (and cost) does
+   * not move when the global default changes. Null only where no named profile
+   * resolves at all, in which case runs follow the `mainAgent` call-site
+   * configuration.
+   */
+  inferenceProfile: string | null;
+  /**
+   * Sidebar group (`conversation_groups` id) for conversations created by
+   * the schedule's runs; null = the default `system:scheduled`. Resolve via
+   * {@link resolveScheduleConversationGroupId}, since the group may have
+   * been deleted since it was set.
+   */
+  groupId: string | null;
+  createdFromConversationId: string | null;
+  createdBy: string;
+  /**
+   * Plugin declaration this row was reconciled from
+   * (`plugin:<pluginName>/<scheduleName>`); null = imperative schedule.
+   * Sourced rows are read-only through {@link updateSchedule} and
+   * {@link deleteSchedule}: the declaration file is the source of truth for
+   * definition columns, and the reconciler is their only writer.
+   */
+  sourceKey: string | null;
+  /**
+   * Reconciler change detector over the plugin's declaration files; null on
+   * imperative rows.
+   */
+  definitionHash: string | null;
+  /**
+   * User enable/disable override for a sourced row; null = the declaration's
+   * own enabled value applies. Always null on imperative rows.
+   */
+  userEnabled: boolean | null;
+  mode: ScheduleMode;
+  routingIntent: RoutingIntent;
+  routingHints: Record<string, unknown>;
+  quiet: boolean;
+  reuseConversation: boolean;
+  status: ScheduleStatus;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ScheduleRun {
+  id: string;
+  jobId: string;
+  status: string;
+  startedAt: number;
+  finishedAt: number | null;
+  durationMs: number | null;
+  output: string | null;
+  error: string | null;
+  conversationId: string | null;
+  createdAt: number;
+}
+
+export function isValidCronExpression(expr: string): boolean {
+  try {
+    new Cron(expr, { maxRuns: 0 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Insert a schedule row. Unexported on purpose: it is the only writer of
+ * `createdBy` and `createdFromConversationId`, the two fields a deferred wake's
+ * firing reads as proof of who authored its target and trigger text. Callers
+ * reach it through {@link createSchedule} (which cannot mint owner-defer
+ * provenance) or {@link createOwnerDeferredWake} (which is the only thing that
+ * can).
+ */
+interface InsertScheduleParams {
+  name: string;
+  description?: string;
+  cronExpression?: string | null;
+  timezone?: string | null;
+  message: string;
+  script?: string | null;
+  wakeConversationId?: string | null;
+  workflowName?: string | null;
+  workflowArgs?: unknown;
+  capabilities?: unknown;
+  enabled?: boolean;
+  createdBy?: string;
+  syntax?: ScheduleSyntax;
+  expression?: string | null;
+  nextRunAt?: number;
+  mode?: ScheduleMode;
+  routingIntent?: RoutingIntent;
+  routingHints?: Record<string, unknown>;
+  quiet?: boolean;
+  reuseConversation?: boolean;
+  maxRetries?: number;
+  retryBackoffMs?: number;
+  timeoutMs?: number | null;
+  inferenceProfile?: string | null;
+  groupId?: string | null;
+  createdFromConversationId?: string | null;
+  sourceKey?: string | null;
+  definitionHash?: string | null;
+}
+
+/**
+ * Values ordinary schedule creation may record in `createdBy`.
+ *
+ * Deliberately a closed union rather than `string`: it excludes the owner-defer
+ * marker at the type level, so {@link createSchedule} cannot express the
+ * provenance that lets a wake firing recover trust. The legacy defer value
+ * stays available because rows written before the marker existed still need to
+ * be representable.
+ */
+export type OrdinaryScheduleCreator =
+  | "agent"
+  | "user"
+  | typeof LEGACY_DEFER_CREATED_BY;
+
+/**
+ * Parameters for ordinary schedule creation. `sourceKey` and `definitionHash`
+ * are excluded for the same structural reason `createdBy` is constrained:
+ * plugin-declaration provenance is minted only by
+ * {@link upsertDeclaredSchedule}, so an ordinary create cannot produce a row
+ * the reconciler believes it owns.
+ */
+export type CreateScheduleParams = Omit<
+  InsertScheduleParams,
+  "createdBy" | "sourceKey" | "definitionHash"
+> & {
+  createdBy?: OrdinaryScheduleCreator;
+};
+
+/**
+ * Timezone stored for a recurring schedule. A wall-clock expression with no
+ * zone otherwise evaluates in the host clock (UTC on managed containers), so
+ * it defaults to the user's configured/detected zone; expressions that carry
+ * their own zone keep the caller's value verbatim.
+ */
+function resolveStoredTimezone(
+  syntax: ScheduleSyntax,
+  expression: string | null,
+  timezone: string | null | undefined,
+): string | null {
+  return expressionCarriesOwnTimezone(syntax, expression)
+    ? (timezone ?? null)
+    : resolveScheduleTimezone(timezone);
+}
+
+async function insertSchedule(
+  params: InsertScheduleParams,
+): Promise<ScheduleJob> {
+  const expression = params.expression ?? params.cronExpression ?? null;
+  const isOneShot = expression == null;
+  const syntax = params.syntax ?? "cron";
+
+  if (isOneShot) {
+    // One-shot schedules must have nextRunAt provided directly
+    if (params.nextRunAt == null) {
+      throw new Error(
+        "One-shot schedules (no expression) require nextRunAt to be provided",
+      );
+    }
+  } else {
+    const spec = { syntax, expression, timezone: params.timezone };
+    if (!isValidScheduleExpression(spec)) {
+      throw new Error(`Invalid ${syntax} expression: "${expression}"`);
+    }
+  }
+
+  if (params.mode === "wake" && !params.wakeConversationId) {
+    throw new Error("Wake schedules require wakeConversationId");
+  }
+
+  const db = getDb();
+  const id = uuid();
+  const now = Date.now();
+  const enabled = params.enabled ?? true;
+  // One-shot schedules (absolute epoch) keep the caller's value verbatim.
+  const timezone = isOneShot
+    ? (params.timezone ?? null)
+    : resolveStoredTimezone(syntax, expression, params.timezone);
+  const mode = params.mode ?? "execute";
+  const routingIntent = params.routingIntent ?? "all_channels";
+  const routingHints = params.routingHints ?? {};
+  const quiet = params.quiet ?? false;
+  const reuseConversation = params.reuseConversation ?? false;
+  const maxRetries = params.maxRetries ?? 3;
+  const retryBackoffMs = params.retryBackoffMs ?? 60000;
+  const timeoutMs = params.timeoutMs ?? null;
+  // The single chokepoint that pins every schedule to a concrete profile: a
+  // caller that names none gets a snapshot of what that row resolves today, so
+  // the schedule's cost stays put when the user changes their global default
+  // profile.
+  //
+  // A wake row snapshots its target conversation's durable pin instead of the
+  // global default, because `buildWakeScheduleOptions` forces the row's pin as
+  // the woken turn's override: an unpinned wake resolves the target's own
+  // choice live, so seeding anything else would silently re-point it. Seeding
+  // here rather than in `createOwnerDeferredWake` makes the rule structural —
+  // it holds for every wake row however it was minted — and matches what
+  // migration 363 backfills onto the rows that predate the pin.
+  const inferenceProfile =
+    params.inferenceProfile ??
+    (mode === "wake"
+      ? resolveWakeScheduleInferenceProfile(
+          getConversation(params.wakeConversationId!) ?? null,
+        )
+      : resolveDefaultScheduleInferenceProfile());
+  const groupId = params.groupId ?? null;
+  const createdFromConversationId = params.createdFromConversationId ?? null;
+  const description = normalizeDescription(
+    params.description,
+    isDeferSchedule(params.createdBy ?? "") ? "" : params.name,
+  );
+
+  let nextRunAt: number;
+  if (isOneShot) {
+    nextRunAt = params.nextRunAt!;
+  } else {
+    nextRunAt = enabled
+      ? computeNextRunAtEngine({ syntax, expression: expression!, timezone })
+      : 0;
+  }
+
+  const row = {
+    id,
+    name: params.name,
+    description,
+    enabled,
+    cronExpression: expression,
+    scheduleSyntax: syntax,
+    timezone,
+    message: params.message,
+    script: params.script ?? null,
+    wakeConversationId: params.wakeConversationId ?? null,
+    workflowName: params.workflowName ?? null,
+    workflowArgsJson:
+      params.workflowArgs === undefined
+        ? null
+        : JSON.stringify(params.workflowArgs),
+    capabilitiesJson:
+      params.capabilities != null ? JSON.stringify(params.capabilities) : null,
+    nextRunAt,
+    lastRunAt: null as number | null,
+    lastStatus: null as string | null,
+    retryCount: 0,
+    maxRetries,
+    retryBackoffMs,
+    timeoutMs,
+    inferenceProfile,
+    groupId,
+    createdFromConversationId,
+    createdBy: params.createdBy ?? "agent",
+    sourceKey: params.sourceKey ?? null,
+    definitionHash: params.definitionHash ?? null,
+    userEnabled: null as boolean | null,
+    mode,
+    routingIntent,
+    routingHintsJson: JSON.stringify(routingHints),
+    quiet,
+    reuseConversation,
+    status: "active" as ScheduleStatus,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await withSqliteRetry(() => db.insert(scheduleJobs).values(row).run(), {
+    op: "createSchedule",
+    context: { scheduleId: id },
+  });
+  notifySchedulesChanged();
+  return parseJobRow(row);
+}
+
+/**
+ * Create an ordinary schedule.
+ *
+ * Cannot mint owner-defer provenance: that marker is what lets an unattended
+ * wake firing recover its target conversation's resting trust, so it is issued
+ * only by {@link createOwnerDeferredWake}, which sets it together with the
+ * target and source binding that give it meaning. Passing the reserved value
+ * here throws rather than silently downgrading, so a caller reaching for it
+ * fails loudly instead of producing a row that looks trusted.
+ */
+export async function createSchedule(
+  params: CreateScheduleParams,
+): Promise<ScheduleJob> {
+  if (params.createdBy && hasOwnerDeferProvenance(params.createdBy)) {
+    throw new Error(
+      "Owner-defer provenance is issued only by createOwnerDeferredWake()",
+    );
+  }
+  return insertSchedule(params);
+}
+
+/**
+ * Create a deferred wake on `conversationId`, carrying durable proof that the
+ * assistant's owner chose both its target and its trigger text.
+ *
+ * The proof is the combination this function sets atomically and nothing else
+ * can assemble: owner provenance in `createdBy`, the wake target, and the
+ * source-conversation binding that must equal it. All three are write-once
+ * (absent from `updateSchedule`'s parameters), and `updateSchedule` refuses to
+ * rewrite the trigger text or target of a row carrying the marker, so a row's
+ * target and text are exactly what this call recorded.
+ *
+ * Callers must have established owner authority first; `defer/create` is the
+ * only production caller and is gated accordingly.
+ *
+ * The pin seeds from the source conversation's durable choice rather than the
+ * global default. A defer resumes the very conversation it was created in, and
+ * `buildWakeScheduleOptions` forces the row's pin as the woken turn's
+ * override, so a defer created inside a conversation the user pinned to a
+ * specific profile must fire on that profile. That seeding lives in
+ * `insertSchedule`, keyed on `mode: "wake"` rather than on defer provenance,
+ * so no wake row can be minted that overrides its target's pin with the global
+ * default.
+ */
+export async function createOwnerDeferredWake(params: {
+  conversationId: string;
+  hint: string;
+  fireAt: number;
+  name?: string;
+  inferenceProfile?: string | null;
+}): Promise<ScheduleJob> {
+  return insertSchedule({
+    name: params.name ?? "Deferred wake",
+    message: params.hint,
+    mode: "wake",
+    wakeConversationId: params.conversationId,
+    createdFromConversationId: params.conversationId,
+    createdBy: OWNER_DEFER_CREATED_BY,
+    nextRunAt: params.fireAt,
+    quiet: true,
+    inferenceProfile: params.inferenceProfile ?? null,
+  });
+}
+
+/**
+ * Sidebar group for conversations created by a schedule's runs. The job's
+ * `groupId` wins only while the group still exists: a schedule may outlive
+ * its custom group, and creating a conversation with a dangling group id
+ * would violate the conversations->conversation_groups FK.
+ */
+export function resolveScheduleConversationGroupId(
+  job: Pick<ScheduleJob, "groupId">,
+): string {
+  if (job.groupId && getGroup(job.groupId)) {
+    return job.groupId;
+  }
+  return "system:scheduled";
+}
+
+export function getSchedule(id: string): ScheduleJob | null {
+  const db = getDb();
+  const row = db
+    .select()
+    .from(scheduleJobs)
+    .where(eq(scheduleJobs.id, id))
+    .get();
+  if (!row) {
+    return null;
+  }
+  return parseJobRow(row);
+}
+
+export function countSchedules(): { total: number; enabled: number } {
+  const db = getDb();
+  const row = db
+    .select({
+      total: sql<number>`COUNT(*)`,
+      enabled: sql<number>`SUM(CASE WHEN ${scheduleJobs.enabled} THEN 1 ELSE 0 END)`,
+    })
+    .from(scheduleJobs)
+    .get();
+  return { total: row?.total ?? 0, enabled: row?.enabled ?? 0 };
+}
+
+export function listSchedules(options?: {
+  enabledOnly?: boolean;
+  oneShotOnly?: boolean;
+  recurringOnly?: boolean;
+  mode?: ScheduleMode;
+  createdBy?: string | readonly string[];
+  conversationId?: string;
+  inferenceProfile?: string;
+}): ScheduleJob[] {
+  const db = getDb();
+  const conditions = [];
+  if (options?.enabledOnly) {
+    conditions.push(eq(scheduleJobs.enabled, true));
+  }
+  if (options?.oneShotOnly) {
+    conditions.push(isNull(scheduleJobs.cronExpression));
+  }
+  if (options?.recurringOnly) {
+    conditions.push(sql`${scheduleJobs.cronExpression} IS NOT NULL`);
+  }
+  if (options?.mode) {
+    conditions.push(eq(scheduleJobs.mode, options.mode));
+  }
+  if (options?.createdBy) {
+    const createdBy = options.createdBy;
+    conditions.push(
+      typeof createdBy === "string"
+        ? eq(scheduleJobs.createdBy, createdBy)
+        : inArray(scheduleJobs.createdBy, [...createdBy]),
+    );
+  }
+  if (options?.conversationId) {
+    conditions.push(
+      eq(scheduleJobs.wakeConversationId, options.conversationId),
+    );
+  }
+  if (options?.inferenceProfile) {
+    conditions.push(
+      eq(scheduleJobs.inferenceProfile, options.inferenceProfile),
+    );
+  }
+  const where = conditions.length > 0 ? and(...conditions) : undefined;
+  const rows = db
+    .select()
+    .from(scheduleJobs)
+    .where(where)
+    .orderBy(asc(scheduleJobs.nextRunAt))
+    .all();
+  return rows.map(parseJobRow);
+}
+
+export async function updateSchedule(
+  id: string,
+  updates: {
+    name?: string;
+    description?: string;
+    cronExpression?: string;
+    timezone?: string | null;
+    message?: string;
+    script?: string | null;
+    enabled?: boolean;
+    syntax?: ScheduleSyntax;
+    expression?: string;
+    mode?: ScheduleMode;
+    routingIntent?: RoutingIntent;
+    routingHints?: Record<string, unknown>;
+    quiet?: boolean;
+    reuseConversation?: boolean;
+    wakeConversationId?: string | null;
+    workflowName?: string | null;
+    workflowArgs?: unknown;
+    capabilities?: unknown;
+    maxRetries?: number;
+    retryBackoffMs?: number;
+    timeoutMs?: number | null;
+    inferenceProfile?: string | null;
+    groupId?: string | null;
+    // `createdBy` and `createdFromConversationId` are deliberately absent: a
+    // deferred wake's firing reads both to decide whether the woken turn may
+    // recover its target conversation's resting trust (see
+    // `wake-schedule-options.ts`), and proof that can be rewritten is not
+    // proof. Keeping them out of this type makes that structural rather than a
+    // caller convention, so reaching for them is a compile error instead of a
+    // silent trust bypass.
+    //
+    // `message`, `wakeConversationId`, and `mode` stay in this type because
+    // ordinary schedules and legacy defers edit them freely. On a row carrying
+    // owner-defer provenance they are immutable, enforced at the top of the
+    // function body rather than in the type, since the distinction is per-row.
+  },
+): Promise<ScheduleJob | null> {
+  const db = getDb();
+  const existing = db
+    .select()
+    .from(scheduleJobs)
+    .where(eq(scheduleJobs.id, id))
+    .get();
+  if (!existing) {
+    return null;
+  }
+
+  // Plugin-sourced rows are read-only here: the plugin's schedule file is the
+  // source of truth for every definition column, and the reconciler would
+  // overwrite any edit on its next pass. Enable/disable goes through
+  // `setUserEnabled`; every other change is an edit to the declaration file.
+  if (existing.sourceKey != null) {
+    throw new UserError(
+      "This schedule is managed by a plugin. Edit the plugin's schedule file instead.",
+    );
+  }
+
+  // Owner-defer provenance certifies that the assistant's owner chose both the
+  // conversation this wake resumes and the text it carries. Rewriting either
+  // would leave the marker standing over content it does not describe, so on
+  // these rows the authority-bearing trio is fixed at creation. Same-value
+  // writes pass, so an idempotent update that echoes current state is not an
+  // error. Changing a trusted defer is cancel-and-recreate through
+  // `createOwnerDeferredWake`, which is exactly what the defer surface exposes.
+  // Legacy defers stay editable and never recover trust either way.
+  if (hasOwnerDeferProvenance(existing.createdBy)) {
+    const rewritesTrigger =
+      updates.message !== undefined && updates.message !== existing.message;
+    const rewritesTarget =
+      updates.wakeConversationId !== undefined &&
+      updates.wakeConversationId !== existing.wakeConversationId;
+    const rewritesMode =
+      updates.mode !== undefined && updates.mode !== existing.mode;
+    if (rewritesTrigger || rewritesTarget || rewritesMode) {
+      // UserError: a caller-facing refusal, not a daemon fault. Transport
+      // surfaces map it to a 4xx carrying this message, not a generic 500.
+      throw new UserError(
+        "A trusted deferred wake's target, trigger text, and mode are fixed at creation; cancel and re-create it",
+      );
+    }
+  }
+
+  // Resolve the effective syntax and expression after this update
+  const newSyntax =
+    updates.syntax ?? (existing.scheduleSyntax as ScheduleSyntax);
+  const newExpr =
+    updates.expression ?? updates.cronExpression ?? existing.cronExpression;
+  const newTimezone =
+    updates.timezone !== undefined ? updates.timezone : existing.timezone;
+  const newEnabled =
+    updates.enabled !== undefined ? updates.enabled : existing.enabled;
+
+  const isOneShot = newExpr == null;
+
+  // Validate if expression, syntax, or timezone changed (only for recurring schedules)
+  if (
+    !isOneShot &&
+    (updates.expression !== undefined ||
+      updates.cronExpression !== undefined ||
+      updates.syntax !== undefined ||
+      updates.timezone !== undefined)
+  ) {
+    const spec = {
+      syntax: newSyntax,
+      expression: newExpr,
+      timezone: newTimezone,
+    };
+    if (!isValidScheduleExpression(spec)) {
+      throw new UserError(`Invalid ${newSyntax} expression: "${newExpr}"`);
+    }
+  }
+
+  const now = Date.now();
+  const set: Record<string, unknown> = { updatedAt: now };
+
+  if (updates.name !== undefined) {
+    set.name = updates.name;
+  }
+  if (updates.description !== undefined) {
+    set.description = normalizeDescription(updates.description);
+  }
+  if (
+    updates.cronExpression !== undefined ||
+    updates.expression !== undefined
+  ) {
+    set.cronExpression = newExpr;
+  }
+  if (updates.syntax !== undefined) {
+    set.scheduleSyntax = newSyntax;
+  }
+  if (updates.timezone !== undefined) {
+    set.timezone = updates.timezone;
+  }
+  if (updates.message !== undefined) {
+    set.message = updates.message;
+  }
+  if (updates.script !== undefined) {
+    set.script = updates.script;
+  }
+  if (updates.enabled !== undefined) {
+    set.enabled = updates.enabled;
+  }
+  if (updates.mode !== undefined) {
+    set.mode = updates.mode;
+  }
+  if (updates.routingIntent !== undefined) {
+    set.routingIntent = updates.routingIntent;
+  }
+  if (updates.routingHints !== undefined) {
+    set.routingHintsJson = JSON.stringify(updates.routingHints);
+  }
+  if (updates.quiet !== undefined) {
+    set.quiet = updates.quiet;
+  }
+  if (updates.reuseConversation !== undefined) {
+    set.reuseConversation = updates.reuseConversation;
+  }
+  if (updates.wakeConversationId !== undefined) {
+    set.wakeConversationId = updates.wakeConversationId;
+  }
+  if (updates.workflowName !== undefined) {
+    set.workflowName = updates.workflowName;
+  }
+  // `workflowArgs` may legitimately be any JSON value (including null), so
+  // detect presence by key rather than `!== undefined`.
+  if ("workflowArgs" in updates) {
+    set.workflowArgsJson =
+      updates.workflowArgs === undefined
+        ? null
+        : JSON.stringify(updates.workflowArgs);
+  }
+  // `capabilities` may legitimately be any JSON value (including null), so
+  // detect presence by key rather than `!== undefined`.
+  if ("capabilities" in updates) {
+    set.capabilitiesJson =
+      updates.capabilities == null
+        ? null
+        : JSON.stringify(updates.capabilities);
+  }
+  if (updates.maxRetries !== undefined) {
+    set.maxRetries = updates.maxRetries;
+  }
+  if (updates.retryBackoffMs !== undefined) {
+    set.retryBackoffMs = updates.retryBackoffMs;
+  }
+  if (updates.timeoutMs !== undefined) {
+    set.timeoutMs = updates.timeoutMs;
+  }
+  if (updates.inferenceProfile !== undefined) {
+    // Null re-snapshots the currently resolved default instead of unpinning:
+    // "follow whatever my global default happens to be" is not a state a
+    // schedule can rest in, since it would let a later default change move the
+    // schedule's model and price without the user touching the schedule.
+    set.inferenceProfile =
+      updates.inferenceProfile ?? resolveDefaultScheduleInferenceProfile();
+  }
+  if (updates.groupId !== undefined) {
+    set.groupId = updates.groupId;
+  }
+
+  // Recompute nextRunAt if schedule timing may have changed (only for recurring)
+  if (
+    !isOneShot &&
+    (updates.cronExpression !== undefined ||
+      updates.expression !== undefined ||
+      updates.syntax !== undefined ||
+      updates.timezone !== undefined ||
+      updates.enabled !== undefined)
+  ) {
+    const spec = {
+      syntax: newSyntax,
+      expression: newExpr!,
+      timezone: newTimezone,
+    };
+    set.nextRunAt = newEnabled ? computeNextRunAtEngine(spec) : 0;
+  }
+
+  await withSqliteRetry(
+    () => db.update(scheduleJobs).set(set).where(eq(scheduleJobs.id, id)).run(),
+    { op: "updateSchedule", context: { scheduleId: id } },
+  );
+  notifySchedulesChanged();
+
+  return getSchedule(id);
+}
+
+/** `source_key` of the row, or null when the row is absent or imperative. */
+function getRowSourceKey(id: string): string | null {
+  const row = getDb()
+    .select({ sourceKey: scheduleJobs.sourceKey })
+    .from(scheduleJobs)
+    .where(eq(scheduleJobs.id, id))
+    .get();
+  return row?.sourceKey ?? null;
+}
+
+export async function deleteSchedule(id: string): Promise<boolean> {
+  const db = getDb();
+  // Plugin-sourced rows keep their identity and run history: deleting one
+  // would just have the reconciler recreate it from the declaration on its
+  // next pass. Disable is the supported action; removal means removing the
+  // plugin's schedule file.
+  if (getRowSourceKey(id) != null) {
+    throw new UserError(
+      "This schedule is managed by a plugin and cannot be deleted. Disable it instead, or remove the plugin's schedule file.",
+    );
+  }
+  // Capture rawChanges() inside the awaited closure: reading it after the
+  // await would race other async DB work on the shared connection.
+  const deleted = await withSqliteRetry(
+    () => {
+      db.delete(scheduleJobs).where(eq(scheduleJobs.id, id)).run();
+      return rawChanges() > 0;
+    },
+    { op: "deleteSchedule", context: { scheduleId: id } },
+  );
+  if (deleted) {
+    notifySchedulesChanged();
+  }
+  return deleted;
+}
+
+// ── Plugin-declared schedules ───────────────────────────────────────
+//
+// Rows with a non-null `source_key` mirror a declaration in a plugin's
+// `schedules/` directory. The reconciler owns their definition columns (via
+// the functions below, the only writers of `source_key`, `definition_hash`,
+// and the definition side of `enabled`), the engine owns the runtime columns,
+// and the user owns `user_enabled`. Rows with a null `source_key` are
+// imperative schedules and none of this section touches them.
+
+/**
+ * Definition of a plugin-declared schedule, as parsed from the plugin's
+ * declaration files. `enabled` is the declaration's own value; the stored
+ * row's `enabled` is the effective value, `user_enabled ?? enabled`.
+ */
+export interface DeclaredScheduleDefinition {
+  name: string;
+  description?: string;
+  syntax: ScheduleSyntax;
+  expression: string;
+  timezone?: string | null;
+  message: string;
+  script?: string | null;
+  mode: Extract<ScheduleMode, "execute" | "script">;
+  maxRetries?: number;
+  retryBackoffMs?: number;
+  quiet?: boolean;
+  inferenceProfile?: string | null;
+  timeoutMs?: number | null;
+  enabled: boolean;
+  definitionHash: string;
+}
+
+/** All plugin-sourced schedule rows, including disarmed ones. */
+export function listDeclaredSchedules(): ScheduleJob[] {
+  const db = getDb();
+  const rows = db
+    .select()
+    .from(scheduleJobs)
+    .where(isNotNull(scheduleJobs.sourceKey))
+    .orderBy(asc(scheduleJobs.nextRunAt))
+    .all();
+  return rows.map(parseJobRow);
+}
+
+/**
+ * True when the engine has latched the row: a fired or cancelled one-shot, or
+ * a recurrence the claim path exhausted. The exhaust path stamps `lastRunAt`
+ * as it writes `nextRunAt = 0` and disables the row, so `nextRunAt = 0` with
+ * a null `lastRunAt` is a declared schedule inserted disabled, not an engine
+ * latch, and stays re-armable.
+ */
+export function isEngineLatched(row: {
+  status: string;
+  nextRunAt: number;
+  lastRunAt: number | null;
+}): boolean {
+  return (
+    row.status === "fired" ||
+    row.status === "cancelled" ||
+    (row.nextRunAt === 0 && row.lastRunAt != null)
+  );
+}
+
+/**
+ * Insert or update the row for a plugin declaration, keyed by `sourceKey`.
+ *
+ * Effective `enabled` (`user_enabled ?? definition.enabled`) is recomputed on
+ * every call, so a row disarmed while its plugin was disabled re-arms once
+ * the declaration is back in the desired set. `nextRunAt` is recomputed only
+ * when the timing changed or the row transitions to enabled; a matching hash
+ * with matching script path and effective `enabled` is a no-op. A script
+ * path that moved on a matching hash (the invocation embeds the absolute
+ * entrypoint path, which moves with the workspace while the hash covers only
+ * schedules/-relative paths and contents) is rewritten without touching
+ * timing. Rows the engine has latched are returned untouched.
+ */
+export async function upsertDeclaredSchedule(
+  sourceKey: string,
+  definition: DeclaredScheduleDefinition,
+): Promise<ScheduleJob> {
+  const db = getDb();
+  const existing = db
+    .select()
+    .from(scheduleJobs)
+    .where(eq(scheduleJobs.sourceKey, sourceKey))
+    .get();
+
+  if (!existing) {
+    return insertSchedule({ ...definition, createdBy: "agent", sourceKey });
+  }
+
+  if (isEngineLatched(existing)) {
+    return parseJobRow(existing);
+  }
+
+  // Same timezone defaulting as insert, so change detection compares the
+  // value that would actually be stored.
+  const timezone = resolveStoredTimezone(
+    definition.syntax,
+    definition.expression,
+    definition.timezone,
+  );
+
+  const definitionChanged =
+    existing.definitionHash !== definition.definitionHash;
+  const scriptChanged = (definition.script ?? null) !== existing.script;
+  const effectiveEnabled = existing.userEnabled ?? definition.enabled;
+  if (
+    !definitionChanged &&
+    !scriptChanged &&
+    effectiveEnabled === existing.enabled
+  ) {
+    return parseJobRow(existing);
+  }
+
+  const spec = {
+    syntax: definition.syntax,
+    expression: definition.expression,
+    timezone,
+  };
+  if (definitionChanged && !isValidScheduleExpression(spec)) {
+    throw new Error(
+      `Invalid ${definition.syntax} expression: "${definition.expression}"`,
+    );
+  }
+
+  const timingChanged =
+    definition.expression !== existing.cronExpression ||
+    definition.syntax !== existing.scheduleSyntax ||
+    timezone !== existing.timezone;
+
+  const set: Record<string, unknown> = {
+    enabled: effectiveEnabled,
+    updatedAt: Date.now(),
+  };
+  if (definitionChanged) {
+    set.name = definition.name;
+    set.description = normalizeDescription(
+      definition.description,
+      definition.name,
+    );
+    set.cronExpression = definition.expression;
+    set.scheduleSyntax = definition.syntax;
+    set.timezone = timezone;
+    set.message = definition.message;
+    set.script = definition.script ?? null;
+    set.mode = definition.mode;
+    set.maxRetries = definition.maxRetries ?? 3;
+    set.retryBackoffMs = definition.retryBackoffMs ?? 60000;
+    set.quiet = definition.quiet ?? false;
+    set.inferenceProfile = definition.inferenceProfile ?? null;
+    set.timeoutMs = definition.timeoutMs ?? null;
+    set.definitionHash = definition.definitionHash;
+  } else if (scriptChanged) {
+    set.script = definition.script ?? null;
+  }
+  // While disabled, `nextRunAt` is left alone so a stale value never reads as
+  // the engine's exhaust latch (`nextRunAt = 0` with `lastRunAt` set).
+  if (
+    effectiveEnabled &&
+    (timingChanged || !existing.enabled || existing.nextRunAt === 0)
+  ) {
+    set.nextRunAt = computeNextRunAtEngine(spec);
+  }
+
+  await withSqliteRetry(
+    () =>
+      db
+        .update(scheduleJobs)
+        .set(set)
+        .where(eq(scheduleJobs.id, existing.id))
+        .run(),
+    { op: "upsertDeclaredSchedule", context: { scheduleId: existing.id } },
+  );
+  notifySchedulesChanged();
+
+  const updated = getSchedule(existing.id);
+  if (!updated) {
+    throw new Error(`Declared schedule ${existing.id} vanished during upsert`);
+  }
+  return updated;
+}
+
+/**
+ * Pause a sourced row whose declaration is gone or whose plugin is disabled.
+ * The row and its runs are kept so a reinstall re-links by `source_key` and
+ * `user_enabled` survives. `nextRunAt` is left alone: a disabled row never
+ * fires, and `nextRunAt = 0` is reserved for the engine's exhaust latch.
+ *
+ * Resolves `true` when this call took an armed row off, and `false` when
+ * there was nothing to do because the row is gone or already disabled. A
+ * caller reporting the pause to the user needs that distinction: a row the
+ * user or the engine already turned off is not something this call paused.
+ */
+export async function disarmDeclaredSchedule(id: string): Promise<boolean> {
+  const db = getDb();
+  const existing = db
+    .select()
+    .from(scheduleJobs)
+    .where(eq(scheduleJobs.id, id))
+    .get();
+  if (!existing) {
+    return false;
+  }
+  if (existing.sourceKey == null) {
+    throw new Error(
+      "disarmDeclaredSchedule applies only to plugin-sourced schedules",
+    );
+  }
+  if (!existing.enabled) {
+    return false;
+  }
+  await withSqliteRetry(
+    () =>
+      db
+        .update(scheduleJobs)
+        .set({ enabled: false, updatedAt: Date.now() })
+        .where(eq(scheduleJobs.id, id))
+        .run(),
+    { op: "disarmDeclaredSchedule", context: { scheduleId: id } },
+  );
+  notifySchedulesChanged();
+  return true;
+}
+
+/**
+ * The user's side of the enabled toggle.
+ *
+ * On an imperative row this is exactly the existing toggle
+ * (`updateSchedule(id, { enabled })`) and `user_enabled` stays null. On a
+ * plugin-sourced row it records the override in `user_enabled` and applies
+ * it to the effective `enabled` on the spot. Engine-latched rows record the
+ * override without being re-armed.
+ */
+export async function setUserEnabled(
+  id: string,
+  value: boolean,
+): Promise<ScheduleJob | null> {
+  const db = getDb();
+  const existing = db
+    .select()
+    .from(scheduleJobs)
+    .where(eq(scheduleJobs.id, id))
+    .get();
+  if (!existing) {
+    return null;
+  }
+  if (existing.sourceKey == null) {
+    return updateSchedule(id, { enabled: value });
+  }
+
+  const set: Record<string, unknown> = {
+    userEnabled: value,
+    updatedAt: Date.now(),
+  };
+  if (value !== existing.enabled && !isEngineLatched(existing)) {
+    // Enabling a row whose declaration is no longer sourceable (plugin
+    // uninstalled or disabled, manifest broken, schedule file removed) would
+    // let it fire an orphaned run before the next reconcile pass disarms it
+    // again. The reconciler is the authority on the declaration set; this
+    // probe only closes that fire-before-next-sweep window. The override
+    // itself is still recorded, so it applies if the declaration returns.
+    // The probe is deliberately disk-only. A schedule tool calls this from a
+    // conversation turn, which can run in a sidecar worker process where the
+    // daemon's activation ledger is empty, so consulting activation here would
+    // refuse to re-arm anything. Activation stays the reconciler's call.
+    if (value && !(await declarationExistsOnDisk(existing.sourceKey))) {
+      logger.info(
+        { scheduleId: id, sourceKey: existing.sourceKey },
+        "Enable override recorded without re-arming: declaration missing on disk",
+      );
+    } else {
+      set.enabled = value;
+      // Re-arming needs a fresh occurrence: the stored one went stale while
+      // the row was disabled. Disabling keeps `nextRunAt`; see the disarm
+      // note.
+      if (value && existing.cronExpression != null) {
+        set.nextRunAt = computeNextRunAtEngine({
+          syntax: existing.scheduleSyntax as ScheduleSyntax,
+          expression: existing.cronExpression,
+          timezone: existing.timezone,
+        });
+      }
+    }
+  }
+
+  await withSqliteRetry(
+    () => db.update(scheduleJobs).set(set).where(eq(scheduleJobs.id, id)).run(),
+    { op: "setUserEnabled", context: { scheduleId: id } },
+  );
+  notifySchedulesChanged();
+  return getSchedule(id);
+}
+
+/**
+ * Claim due schedules atomically. Handles both recurring and one-shot schedules.
+ *
+ * For recurring schedules: advance next_run_at using optimistic locking on the
+ * old value to prevent double-claiming by concurrent ticks. Works for both
+ * cron and RRULE syntax.
+ *
+ * For one-shot schedules: transition status from 'active' to 'firing' where
+ * next_run_at <= now and enabled = true and cron_expression IS NULL.
+ */
+export async function claimDueSchedules(now: number): Promise<ScheduleJob[]> {
+  // Drain gate: while a quiesce lease is active, claim nothing so in-flight
+  // runs can drain before a stop. The check lives here — immediately before
+  // the claim writes — rather than at the tick boundary, to shrink the window
+  // in which a lease armed mid-tick could miss a claim that already passed an
+  // earlier check. Fail-open via the lease read.
+  if (isLifecycleQuiesced()) {
+    return [];
+  }
+
+  const db = getDb();
+  const claimed: ScheduleJob[] = [];
+
+  // ── Recurring schedules ──────────────────────────────────────────
+  const recurringCandidates = db
+    .select()
+    .from(scheduleJobs)
+    .where(
+      and(
+        eq(scheduleJobs.enabled, true),
+        lte(scheduleJobs.nextRunAt, now),
+        sql`${scheduleJobs.cronExpression} IS NOT NULL`,
+      ),
+    )
+    .orderBy(asc(scheduleJobs.nextRunAt))
+    .all();
+
+  for (const row of recurringCandidates) {
+    let newNextRunAt: number | null;
+    let exhausted = false;
+    try {
+      const syntax = row.scheduleSyntax as ScheduleSyntax;
+      newNextRunAt = computeNextRunAtEngine({
+        syntax,
+        expression: row.cronExpression!,
+        timezone: row.timezone,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes("no upcoming runs")) {
+        // Log but don't abort — one bad schedule shouldn't block everything
+        logger.warn(
+          { err, scheduleId: row.id },
+          "Failed to compute next run for schedule",
+        );
+        continue;
+      }
+      // Expired schedules fire their final pending due run then auto-disable,
+      // ensuring no due run is silently dropped.
+      newNextRunAt = null;
+      exhausted = true;
+    }
+
+    // Optimistic lock: only update if nextRunAt hasn't changed
+    const updates: Record<string, unknown> = {
+      lastRunAt: now,
+      updatedAt: now,
+    };
+    if (exhausted) {
+      updates.nextRunAt = 0;
+      updates.enabled = false;
+    } else {
+      updates.nextRunAt = newNextRunAt!;
+    }
+
+    const recurringClaimed = await withSqliteRetry(
+      () => {
+        db.update(scheduleJobs)
+          .set(updates)
+          .where(
+            and(
+              eq(scheduleJobs.id, row.id),
+              eq(scheduleJobs.nextRunAt, row.nextRunAt),
+            ),
+          )
+          .run();
+        return rawChanges() > 0;
+      },
+      { op: "claimDueSchedules.recurring", context: { scheduleId: row.id } },
+    );
+
+    if (!recurringClaimed) {
+      continue;
+    }
+
+    claimed.push(
+      parseJobRow({
+        ...row,
+        nextRunAt: exhausted ? 0 : newNextRunAt!,
+        lastRunAt: now,
+        updatedAt: now,
+        enabled: exhausted ? false : row.enabled,
+      }),
+    );
+  }
+
+  // ── One-shot schedules ───────────────────────────────────────────
+  const oneShotCandidates = db
+    .select()
+    .from(scheduleJobs)
+    .where(
+      and(
+        isNull(scheduleJobs.cronExpression),
+        eq(scheduleJobs.status, "active"),
+        lte(scheduleJobs.nextRunAt, now),
+        eq(scheduleJobs.enabled, true),
+      ),
+    )
+    .orderBy(asc(scheduleJobs.nextRunAt))
+    .all();
+
+  for (const row of oneShotCandidates) {
+    const oneShotClaimed = await withSqliteRetry(
+      () => {
+        db.update(scheduleJobs)
+          .set({
+            status: "firing",
+            lastRunAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(eq(scheduleJobs.id, row.id), eq(scheduleJobs.status, "active")),
+          )
+          .run();
+        return rawChanges() > 0;
+      },
+      { op: "claimDueSchedules.oneShot", context: { scheduleId: row.id } },
+    );
+
+    if (!oneShotClaimed) {
+      continue;
+    }
+
+    claimed.push(
+      parseJobRow({
+        ...row,
+        status: "firing",
+        lastRunAt: now,
+        updatedAt: now,
+      }),
+    );
+  }
+
+  if (claimed.length > 0) {
+    notifySchedulesChanged();
+  }
+  return claimed;
+}
+
+/**
+ * Complete a one-shot schedule after successful execution.
+ * Transitions status from 'firing' to 'fired' and disables the schedule.
+ */
+export async function completeOneShot(id: string): Promise<void> {
+  const db = getDb();
+  const now = Date.now();
+  const changed = await withSqliteRetry(
+    () => {
+      db.update(scheduleJobs)
+        .set({
+          status: "fired",
+          enabled: false,
+          updatedAt: now,
+        })
+        .where(and(eq(scheduleJobs.id, id), eq(scheduleJobs.status, "firing")))
+        .run();
+      return rawChanges() > 0;
+    },
+    { op: "completeOneShot", context: { scheduleId: id } },
+  );
+  if (changed) {
+    notifySchedulesChanged();
+  }
+}
+
+/**
+ * Revert a one-shot schedule from 'firing' back to 'active' on failure.
+ * Allows the schedule to be retried on the next tick.
+ */
+export async function failOneShot(id: string): Promise<void> {
+  const db = getDb();
+  const now = Date.now();
+  const changed = await withSqliteRetry(
+    () => {
+      db.update(scheduleJobs)
+        .set({
+          status: "active",
+          updatedAt: now,
+        })
+        .where(and(eq(scheduleJobs.id, id), eq(scheduleJobs.status, "firing")))
+        .run();
+      return rawChanges() > 0;
+    },
+    { op: "failOneShot", context: { scheduleId: id } },
+  );
+  if (changed) {
+    notifySchedulesChanged();
+  }
+}
+
+/**
+ * Revert a one-shot from 'firing' back to 'active' and increment its
+ * retry count. Used when a wake times out waiting for an idle conversation
+ * — the job should be retried on the next scheduler tick.
+ */
+export async function retryOneShot(id: string): Promise<void> {
+  const db = getDb();
+  const now = Date.now();
+  const changed = await withSqliteRetry(
+    () => {
+      db.update(scheduleJobs)
+        .set({
+          status: "active",
+          retryCount: sql`${scheduleJobs.retryCount} + 1`,
+          updatedAt: now,
+        })
+        .where(and(eq(scheduleJobs.id, id), eq(scheduleJobs.status, "firing")))
+        .run();
+      return rawChanges() > 0;
+    },
+    { op: "retryOneShot", context: { scheduleId: id } },
+  );
+  if (changed) {
+    notifySchedulesChanged();
+  }
+}
+
+/**
+ * Permanently fail a one-shot schedule by marking it as cancelled and
+ * disabled. Used when a wake has exceeded its retry cap and should not
+ * be retried further.
+ */
+export async function failOneShotPermanently(id: string): Promise<void> {
+  const db = getDb();
+  const now = Date.now();
+  const changed = await withSqliteRetry(
+    () => {
+      db.update(scheduleJobs)
+        .set({
+          status: "cancelled",
+          enabled: false,
+          lastStatus: "error",
+          updatedAt: now,
+        })
+        .where(and(eq(scheduleJobs.id, id), eq(scheduleJobs.status, "firing")))
+        .run();
+      return rawChanges() > 0;
+    },
+    { op: "failOneShotPermanently", context: { scheduleId: id } },
+  );
+  if (changed) {
+    notifySchedulesChanged();
+  }
+}
+
+/**
+ * Cancel a one-shot schedule. Sets status to 'cancelled' and disables it.
+ * Returns true if a row was actually updated (i.e., it was in 'active' status).
+ */
+export async function cancelSchedule(id: string): Promise<boolean> {
+  const db = getDb();
+  // Cancelled is a permanent latch on a sourced row: the reconciler, the
+  // enabled toggle, and delete all skip it, so cancelling would brick the
+  // plugin's schedule even across reinstalls. Disable is the supported
+  // action, as with update and delete.
+  if (getRowSourceKey(id) != null) {
+    throw new UserError(
+      "This schedule is managed by a plugin and cannot be cancelled. Disable it instead via the enabled toggle.",
+    );
+  }
+  const now = Date.now();
+  const cancelled = await withSqliteRetry(
+    () => {
+      db.update(scheduleJobs)
+        .set({
+          status: "cancelled",
+          enabled: false,
+          updatedAt: now,
+        })
+        .where(and(eq(scheduleJobs.id, id), eq(scheduleJobs.status, "active")))
+        .run();
+      return rawChanges() > 0;
+    },
+    { op: "cancelSchedule", context: { scheduleId: id } },
+  );
+  if (cancelled) {
+    notifySchedulesChanged();
+  }
+  return cancelled;
+}
+
+export async function createScheduleRun(
+  jobId: string,
+  conversationId: string | null,
+): Promise<string> {
+  const db = getDb();
+  const id = uuid();
+  const now = Date.now();
+  await withSqliteRetry(
+    () =>
+      db
+        .insert(scheduleRuns)
+        .values({
+          id,
+          jobId,
+          status: "running",
+          startedAt: now,
+          finishedAt: null,
+          durationMs: null,
+          output: null,
+          error: null,
+          conversationId,
+          createdAt: now,
+        })
+        .run(),
+    { op: "createScheduleRun", context: { scheduleId: jobId, runId: id } },
+  );
+  return id;
+}
+
+/** Currently-running schedule runs with their job names, oldest first. */
+export function listRunningScheduleRuns(): Array<{
+  runId: string;
+  scheduleName: string | null;
+  startedAt: number;
+}> {
+  const db = getDb();
+  return db
+    .select({
+      runId: scheduleRuns.id,
+      scheduleName: scheduleJobs.name,
+      startedAt: scheduleRuns.startedAt,
+    })
+    .from(scheduleRuns)
+    .leftJoin(scheduleJobs, eq(scheduleRuns.jobId, scheduleJobs.id))
+    .where(eq(scheduleRuns.status, "running"))
+    .orderBy(asc(scheduleRuns.startedAt))
+    .limit(20)
+    .all();
+}
+
+export async function setScheduleRunConversationId(
+  runId: string,
+  conversationId: string,
+): Promise<void> {
+  const db = getDb();
+  await withSqliteRetry(
+    () =>
+      db
+        .update(scheduleRuns)
+        .set({ conversationId })
+        .where(eq(scheduleRuns.id, runId))
+        .run(),
+    { op: "setScheduleRunConversationId", context: { runId } },
+  );
+}
+
+/**
+ * Close out a run row, leaving the parent job alone. Returns the job the run
+ * belongs to and the timestamp the row was finished at, or null when the run
+ * no longer exists.
+ */
+async function finishScheduleRunRow(
+  runId: string,
+  result: { status: "ok" | "error"; output?: string; error?: string },
+): Promise<{ jobId: string; now: number } | null> {
+  const db = getDb();
+  const now = Date.now();
+
+  const run = db
+    .select()
+    .from(scheduleRuns)
+    .where(eq(scheduleRuns.id, runId))
+    .get();
+  if (!run) {
+    return null;
+  }
+
+  const durationMs = now - run.startedAt;
+
+  await withSqliteRetry(
+    () =>
+      db
+        .update(scheduleRuns)
+        .set({
+          status: result.status,
+          finishedAt: now,
+          durationMs,
+          output: result.output?.slice(0, 10_000) ?? null,
+          error: result.error?.slice(0, 2000) ?? null,
+        })
+        .where(eq(scheduleRuns.id, runId))
+        .run(),
+    { op: "finishScheduleRunRow", context: { runId } },
+  );
+
+  return { jobId: run.jobId, now };
+}
+
+/**
+ * Record a run the scheduler declined to start, without charging it to the
+ * schedule's retry budget.
+ *
+ * An administrative skip (the plugin behind a sourced row is disabled,
+ * uninstalled, or broken) is not a failed attempt: nothing ran, so there is
+ * nothing to retry. `retryCount` is therefore left where it is, and no retry
+ * is scheduled, which leaves a recurring row on the next occurrence its claim
+ * advanced it to rather than on retry-backoff cadence. `lastStatus` still
+ * moves to `error` and the run row is still written, so the skip is visible
+ * in the schedule's history.
+ */
+export async function recordAdministrativeSkipRun(
+  jobId: string,
+  reason: string,
+): Promise<void> {
+  const db = getDb();
+  const runId = await createScheduleRun(jobId, null);
+  const finished = await finishScheduleRunRow(runId, {
+    status: "error",
+    error: reason,
+  });
+  if (!finished) {
+    return;
+  }
+  const changed = await withSqliteRetry(
+    () => {
+      db.update(scheduleJobs)
+        .set({ lastStatus: "error", updatedAt: finished.now })
+        .where(eq(scheduleJobs.id, jobId))
+        .run();
+      return rawChanges() > 0;
+    },
+    {
+      op: "recordAdministrativeSkipRun.job",
+      context: { scheduleId: jobId },
+    },
+  );
+  if (changed) {
+    notifySchedulesChanged();
+  }
+}
+
+export async function completeScheduleRun(
+  runId: string,
+  result: { status: "ok" | "error"; output?: string; error?: string },
+): Promise<void> {
+  const db = getDb();
+  const finished = await finishScheduleRunRow(runId, result);
+  if (!finished) {
+    return;
+  }
+  const { jobId, now } = finished;
+
+  // Update the parent job's lastStatus and retryCount
+  if (result.status === "error") {
+    // Increment retry count
+    const job = db
+      .select()
+      .from(scheduleJobs)
+      .where(eq(scheduleJobs.id, jobId))
+      .get();
+    if (job) {
+      const changed = await withSqliteRetry(
+        () => {
+          db.update(scheduleJobs)
+            .set({
+              lastStatus: "error",
+              retryCount: job.retryCount + 1,
+              updatedAt: now,
+            })
+            .where(eq(scheduleJobs.id, jobId))
+            .run();
+          return rawChanges() > 0;
+        },
+        {
+          op: "completeScheduleRun.jobError",
+          context: { scheduleId: jobId },
+        },
+      );
+      if (changed) {
+        notifySchedulesChanged();
+      }
+    }
+  } else {
+    const changed = await withSqliteRetry(
+      () => {
+        db.update(scheduleJobs)
+          .set({ lastStatus: "ok", retryCount: 0, updatedAt: now })
+          .where(eq(scheduleJobs.id, jobId))
+          .run();
+        return rawChanges() > 0;
+      },
+      { op: "completeScheduleRun.jobOk", context: { scheduleId: jobId } },
+    );
+    if (changed) {
+      notifySchedulesChanged();
+    }
+  }
+}
+
+/**
+ * Return the conversation ID from the most recent successful run
+ * for a given schedule, or null if none exists.
+ */
+export function getLastScheduleConversationId(jobId: string): string | null {
+  const db = getDb();
+  const row = db
+    .select({ conversationId: scheduleRuns.conversationId })
+    .from(scheduleRuns)
+    .where(
+      and(
+        eq(scheduleRuns.jobId, jobId),
+        eq(scheduleRuns.status, "ok"),
+        sql`${scheduleRuns.conversationId} IS NOT NULL`,
+      ),
+    )
+    .orderBy(desc(scheduleRuns.createdAt))
+    .limit(1)
+    .get();
+  return row?.conversationId ?? null;
+}
+
+/**
+ * List runs for a schedule, newest first. When `before` is set, only runs
+ * with `createdAt` strictly older than it are returned (cursor for
+ * paginating into history).
+ */
+export function getScheduleRuns(
+  jobId: string,
+  limit?: number,
+  before?: number,
+): ScheduleRun[] {
+  const db = getDb();
+  const rows = db
+    .select()
+    .from(scheduleRuns)
+    .where(
+      and(
+        eq(scheduleRuns.jobId, jobId),
+        before != null ? lt(scheduleRuns.createdAt, before) : undefined,
+      ),
+    )
+    .orderBy(desc(scheduleRuns.createdAt))
+    .limit(limit ?? 10)
+    .all();
+  return rows.map(parseRunRow);
+}
+
+export function formatLocalDate(timestamp: number): string {
+  return new Date(timestamp).toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
+}
+
+// Convert a cron expression to a human-readable description.
+// Only applicable to cron syntax; RRULE schedules should display the
+// raw expression text instead.
+// Returns "One-time" for null expressions (one-shot schedules).
+//
+// Examples:
+//   null                -> "One-time"
+//   "* * * * *"         -> "Every minute"
+//   "0 9 * * 1-5"       -> "Every weekday at 9:00 AM"
+//   "0 9 * * 0,6"       -> "Every weekend at 9:00 AM"
+//   "0 9 1 * *"         -> "On the 1st of every month at 9:00 AM"
+//   "30 14 * * *"       -> "Every day at 2:30 PM"
+export function describeCronExpression(expr: string | null): string {
+  if (!expr) {
+    return "One-time";
+  }
+  try {
+    const cron = new Cron(expr, { maxRuns: 0 });
+    // Access Croner internal state to extract the parsed cron pattern.
+    // This is fragile but necessary — Croner doesn't expose a public API for this.
+    const cronInternal = cron as unknown as Record<string, unknown>;
+    const states = cronInternal._states;
+    if (!states || typeof states !== "object") {
+      return expr;
+    }
+    const p = (states as Record<string, unknown>).pattern;
+    if (!p || typeof p !== "object") {
+      return expr;
+    }
+    const pattern = p as {
+      minute: number[];
+      hour: number[];
+      day: number[];
+      month: number[];
+      dayOfWeek: number[];
+      starDOM: boolean;
+      starDOW: boolean;
+    };
+
+    const activeMinutes = pattern.minute.reduce<number[]>((acc, v, i) => {
+      if (v) {
+        acc.push(i);
+      }
+      return acc;
+    }, []);
+    const activeHours = pattern.hour.reduce<number[]>((acc, v, i) => {
+      if (v) {
+        acc.push(i);
+      }
+      return acc;
+    }, []);
+    const activeDays = pattern.day.reduce<number[]>((acc, v, i) => {
+      if (v) {
+        acc.push(i + 1);
+      }
+      return acc;
+    }, []);
+    const activeDOW = pattern.dayOfWeek.reduce<number[]>((acc, v, i) => {
+      if (v) {
+        acc.push(i);
+      }
+      return acc;
+    }, []);
+    const activeMonths = pattern.month.reduce<number[]>((acc, v, i) => {
+      if (v) {
+        acc.push(i + 1);
+      }
+      return acc;
+    }, []);
+
+    const allMinutes = activeMinutes.length === 60;
+    const allHours = activeHours.length === 24;
+    const allDays = pattern.starDOM;
+    const allDOW = pattern.starDOW;
+    const allMonths = activeMonths.length === 12;
+
+    const fixedMinute = activeMinutes.length === 1;
+    const fixedHour = activeHours.length === 1;
+    const fixedTime = fixedMinute && fixedHour;
+    const steppedMinutes = !allMinutes && activeMinutes.length > 1;
+    const steppedHours = !allHours && activeHours.length > 1;
+    const anyDay = allDays && allDOW;
+    const anyDayAndMonth = anyDay && allMonths;
+
+    // Format time as 12-hour clock
+    function formatTime(hour: number, minute: number): string {
+      const period = hour >= 12 ? "PM" : "AM";
+      const h = hour % 12 || 12;
+      const m = minute.toString().padStart(2, "0");
+      return `${h}:${m} ${period}`;
+    }
+
+    // Ordinal suffix helper
+    function ordinal(n: number): string {
+      const s = ["th", "st", "nd", "rd"];
+      const v = n % 100;
+      return n + (s[(v - 20) % 10] || s[v] || s[0]);
+    }
+
+    if (allMinutes && allHours && anyDayAndMonth) {
+      return "Every minute";
+    }
+
+    if (steppedMinutes && allHours && anyDayAndMonth) {
+      if (activeMinutes.length >= 2 && activeMinutes[0] === 0) {
+        const step = activeMinutes[1] - activeMinutes[0];
+        const isRegularStep = activeMinutes.every((v, i) => v === i * step);
+        if (isRegularStep && 60 % step === 0) {
+          return `Every ${step} minutes`;
+        }
+      }
+    }
+
+    if (fixedMinute && allHours && anyDayAndMonth) {
+      if (activeMinutes[0] === 0) {
+        return "Every hour";
+      }
+      return `Every hour at minute ${activeMinutes[0]}`;
+    }
+
+    if (fixedMinute && steppedHours && anyDayAndMonth) {
+      if (activeHours.length >= 2 && activeHours[0] === 0) {
+        const step = activeHours[1] - activeHours[0];
+        const isRegularStep = activeHours.every((v, i) => v === i * step);
+        if (isRegularStep && 24 % step === 0) {
+          return `Every ${step} hours`;
+        }
+      }
+    }
+
+    if (fixedTime && allMonths) {
+      const timeStr = formatTime(activeHours[0], activeMinutes[0]);
+
+      if (allDays && !allDOW) {
+        if (
+          activeDOW.length === 5 &&
+          activeDOW.every((d) => d >= 1 && d <= 5)
+        ) {
+          return `Every weekday at ${timeStr}`;
+        }
+        if (
+          activeDOW.length === 2 &&
+          activeDOW.includes(0) &&
+          activeDOW.includes(6)
+        ) {
+          return `Every weekend at ${timeStr}`;
+        }
+        const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        const names = activeDOW.map((d) => dayNames[d]);
+        return `Every ${names.join(", ")} at ${timeStr}`;
+      }
+
+      if (!allDays && allDOW && activeDays.length === 1) {
+        return `On the ${ordinal(activeDays[0])} of every month at ${timeStr}`;
+      }
+
+      if (anyDay) {
+        return `Every day at ${timeStr}`;
+      }
+    }
+
+    // Stepped or fixed minutes constrained to a contiguous range of hours,
+    // every day/month (e.g. "*/30 7-23 * * *" → "Every 30 minutes, 7 AM–11 PM").
+    const hoursAreContiguousRange =
+      !allHours &&
+      activeHours.length > 1 &&
+      activeHours.every((h, i) => i === 0 || h === activeHours[i - 1] + 1);
+
+    if (hoursAreContiguousRange && anyDayAndMonth) {
+      const hourLabel = (h: number) => {
+        const period = h >= 12 ? "PM" : "AM";
+        return `${h % 12 || 12} ${period}`;
+      };
+      const rangeStr = `${hourLabel(activeHours[0])}–${hourLabel(
+        activeHours[activeHours.length - 1],
+      )}`;
+
+      if (steppedMinutes && activeMinutes[0] === 0) {
+        const step = activeMinutes[1] - activeMinutes[0];
+        const isRegularStep = activeMinutes.every((v, i) => v === i * step);
+        if (isRegularStep && 60 % step === 0) {
+          return `Every ${step} minutes, ${rangeStr}`;
+        }
+      }
+      if (fixedMinute) {
+        return activeMinutes[0] === 0
+          ? `Hourly, ${rangeStr}`
+          : `Hourly at minute ${activeMinutes[0]}, ${rangeStr}`;
+      }
+    }
+
+    // Fallback: return the raw expression
+    return expr;
+  } catch {
+    return expr;
+  }
+}
+
+/**
+ * Return a claimed-but-not-started schedule to the queue (drain deferral).
+ *
+ * Restores everything the claim mutated before any execution began:
+ * `nextRunAt` is pulled to `nextRetryAt`, a one-shot's `firing` reverts to
+ * `active`, and `enabled` is restored — a bounded recurring schedule's final
+ * occurrence is claimed by exhausting the job (`enabled = false`,
+ * `nextRunAt = 0`), so without the restore that deferred final occurrence
+ * would never fire.
+ */
+export async function deferClaimedSchedule(
+  id: string,
+  nextRetryAt: number,
+): Promise<void> {
+  const db = getDb();
+  const now = Date.now();
+  await withSqliteRetry(
+    () => {
+      db.update(scheduleJobs)
+        .set({ nextRunAt: nextRetryAt, enabled: true, updatedAt: now })
+        .where(eq(scheduleJobs.id, id))
+        .run();
+      return rawChanges() > 0;
+    },
+    { op: "deferClaimedSchedule.requeue", context: { scheduleId: id } },
+  );
+  await withSqliteRetry(
+    () => {
+      db.update(scheduleJobs)
+        .set({ status: "active", updatedAt: now })
+        .where(and(eq(scheduleJobs.id, id), eq(scheduleJobs.status, "firing")))
+        .run();
+      return rawChanges() > 0;
+    },
+    { op: "deferClaimedSchedule.status", context: { scheduleId: id } },
+  );
+  notifySchedulesChanged();
+}
+
+/**
+ * Set the next retry time for a schedule and revert one-shot status from
+ * "firing" to "active" so the scheduler will claim it again when nextRetryAt
+ * arrives. No-op for recurring schedules (they stay in their current status).
+ */
+export async function scheduleRetry(
+  id: string,
+  nextRetryAt: number,
+): Promise<void> {
+  const db = getDb();
+  const now = Date.now();
+  let changed = await withSqliteRetry(
+    () => {
+      db.update(scheduleJobs)
+        .set({ nextRunAt: nextRetryAt, updatedAt: now })
+        .where(eq(scheduleJobs.id, id))
+        .run();
+      return rawChanges() > 0;
+    },
+    { op: "scheduleRetry.nextRunAt", context: { scheduleId: id } },
+  );
+  // Revert one-shot status from "firing" to "active" so the scheduler
+  // will claim it again when nextRetryAt arrives. No-op for recurring.
+  const reverted = await withSqliteRetry(
+    () => {
+      db.update(scheduleJobs)
+        .set({ status: "active", updatedAt: now })
+        .where(and(eq(scheduleJobs.id, id), eq(scheduleJobs.status, "firing")))
+        .run();
+      return rawChanges() > 0;
+    },
+    { op: "scheduleRetry.revertStatus", context: { scheduleId: id } },
+  );
+  changed = reverted || changed;
+  if (changed) {
+    notifySchedulesChanged();
+  }
+}
+
+/**
+ * Reset the retry count for a schedule back to zero (e.g. after a successful run).
+ */
+export async function resetRetryCount(id: string): Promise<void> {
+  const db = getDb();
+  const changed = await withSqliteRetry(
+    () => {
+      db.update(scheduleJobs)
+        .set({ retryCount: 0, updatedAt: Date.now() })
+        .where(eq(scheduleJobs.id, id))
+        .run();
+      return rawChanges() > 0;
+    },
+    { op: "resetRetryCount", context: { scheduleId: id } },
+  );
+  if (changed) {
+    notifySchedulesChanged();
+  }
+}
+
+/**
+ * Find schedules stuck in an in-flight state (one-shots in "firing",
+ * cron runs in "running"). Used at daemon startup to recover from
+ * a prior process crash.
+ *
+ * @param staleThresholdMs If >0, only consider rows whose lastRunAt
+ *   (for one-shots) or startedAt (for runs) is older than `now - staleThresholdMs`.
+ *   Pass 0 at startup (the previous process is definitely dead).
+ */
+export function findStaleInFlightJobs(staleThresholdMs: number = 0): Array<{
+  jobId: string;
+  staleRunId: string | null;
+}> {
+  const db = getDb();
+  const cutoff = Date.now() - staleThresholdMs;
+
+  // One-shots stuck in "firing" where lastRunAt is older than cutoff
+  const staleOneShots = db
+    .select({ id: scheduleJobs.id })
+    .from(scheduleJobs)
+    .where(
+      and(
+        isNull(scheduleJobs.cronExpression),
+        eq(scheduleJobs.status, "firing"),
+        eq(scheduleJobs.enabled, true),
+        staleThresholdMs > 0 ? lte(scheduleJobs.lastRunAt, cutoff) : undefined,
+      ),
+    )
+    .all();
+
+  // Cron runs stuck in "running" where startedAt is older than cutoff
+  const staleRuns = db
+    .select({ id: scheduleRuns.id, jobId: scheduleRuns.jobId })
+    .from(scheduleRuns)
+    .where(
+      and(
+        eq(scheduleRuns.status, "running"),
+        staleThresholdMs > 0 ? lte(scheduleRuns.startedAt, cutoff) : undefined,
+      ),
+    )
+    .all();
+
+  const result: Array<{ jobId: string; staleRunId: string | null }> = [];
+  const seenJobIds = new Set<string>();
+
+  for (const run of staleRuns) {
+    result.push({ jobId: run.jobId, staleRunId: run.id });
+    seenJobIds.add(run.jobId);
+  }
+  for (const job of staleOneShots) {
+    if (!seenJobIds.has(job.id)) {
+      result.push({ jobId: job.id, staleRunId: null });
+    }
+  }
+  return result;
+}
+
+function parseJobRow(row: typeof scheduleJobs.$inferSelect): ScheduleJob {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description ?? "",
+    enabled: row.enabled,
+    syntax: row.scheduleSyntax as ScheduleSyntax,
+    expression: row.cronExpression,
+    cronExpression: row.cronExpression,
+    timezone: row.timezone,
+    message: row.message,
+    script: row.script ?? null,
+    wakeConversationId: row.wakeConversationId ?? null,
+    workflowName: row.workflowName ?? null,
+    workflowArgs: parseOptionalJson(row.workflowArgsJson),
+    capabilities: parseOptionalJson(row.capabilitiesJson),
+    nextRunAt: row.nextRunAt,
+    lastRunAt: row.lastRunAt,
+    lastStatus: row.lastStatus,
+    retryCount: row.retryCount,
+    maxRetries: row.maxRetries ?? 3,
+    retryBackoffMs: row.retryBackoffMs ?? 60000,
+    timeoutMs: row.timeoutMs ?? null,
+    inferenceProfile: row.inferenceProfile ?? null,
+    groupId: row.groupId ?? null,
+    createdFromConversationId: row.createdFromConversationId ?? null,
+    createdBy: row.createdBy,
+    sourceKey: row.sourceKey ?? null,
+    definitionHash: row.definitionHash ?? null,
+    userEnabled: row.userEnabled ?? null,
+    mode: (row.mode ?? "execute") as ScheduleMode,
+    routingIntent: (row.routingIntent ?? "all_channels") as RoutingIntent,
+    routingHints: safeParseJson(row.routingHintsJson),
+    quiet: row.quiet ?? false,
+    reuseConversation: row.reuseConversation ?? false,
+    status: (row.status ?? "active") as ScheduleStatus,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function normalizeDescription(
+  value: string | undefined,
+  fallback = "",
+): string {
+  const normalized = value?.trim() ?? "";
+  return normalized || fallback;
+}
+
+function safeParseJson(
+  json: string | null | undefined,
+): Record<string, unknown> {
+  if (!json) {
+    return {};
+  }
+  try {
+    return JSON.parse(json) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Parse a nullable JSON column into an arbitrary value. Unlike
+ * {@link safeParseJson}, the result is not coerced to an object — workflow
+ * args may be any JSON value — and an absent/unparseable column yields null.
+ */
+function parseOptionalJson(json: string | null | undefined): unknown {
+  if (json == null) {
+    return null;
+  }
+  try {
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+function parseRunRow(row: typeof scheduleRuns.$inferSelect): ScheduleRun {
+  return {
+    id: row.id,
+    jobId: row.jobId,
+    status: row.status,
+    startedAt: row.startedAt,
+    finishedAt: row.finishedAt,
+    durationMs: row.durationMs,
+    output: row.output,
+    error: row.error,
+    conversationId: row.conversationId,
+    createdAt: row.createdAt,
+  };
+}

@@ -1,0 +1,902 @@
+import { beforeEach, describe, expect, mock, test } from "bun:test";
+
+// ---------------------------------------------------------------------------
+// Mocks — must be set up BEFORE importing the module under test
+// ---------------------------------------------------------------------------
+
+// Track calls to prepareOAuth2Flow and startOAuth2Flow
+let lastPrepareArgs: { config: unknown; options: unknown } | null = null;
+let lastStartArgs: {
+  config: unknown;
+  callbacks: unknown;
+  options: unknown;
+} | null = null;
+
+let mockPrepareResult: {
+  authorizeUrl: string;
+  state: string;
+  completion: Promise<{
+    tokens: { accessToken: string; refreshToken?: string };
+    grantedScopes: string[];
+    rawTokenResponse: Record<string, unknown>;
+  }>;
+} = {
+  authorizeUrl: "https://provider.example.com/authorize?prepared",
+  state: "mock-state-123",
+  completion: new Promise(() => {}), // never resolves by default
+};
+
+let mockStartResult: {
+  tokens: { accessToken: string; refreshToken?: string };
+  grantedScopes: string[];
+  rawTokenResponse: Record<string, unknown>;
+} = {
+  tokens: { accessToken: "mock-access-token" },
+  grantedScopes: ["read", "write"],
+  rawTokenResponse: { access_token: "mock-access-token" },
+};
+
+mock.module("../security/oauth2.js", () => ({
+  prepareOAuth2Flow: async (config: unknown, options: unknown) => {
+    lastPrepareArgs = { config, options };
+    return mockPrepareResult;
+  },
+  startOAuth2Flow: async (
+    config: unknown,
+    callbacks: unknown,
+    options: unknown,
+  ) => {
+    lastStartArgs = { config, callbacks, options };
+    return mockStartResult;
+  },
+}));
+
+// Mock identity verifier — returns a stable account identifier
+let mockIdentityResult: string | undefined = "user@example.com";
+
+mock.module("../oauth/identity-verifier.js", () => ({
+  verifyIdentity: async () => mockIdentityResult,
+}));
+
+// Mock token persistence — just returns the accountInfo
+mock.module("../oauth/token-persistence.js", () => ({
+  storeOAuth2Tokens: async (params: { parsedAccountIdentifier?: string }) => ({
+    accountInfo: params.parsedAccountIdentifier ?? undefined,
+  }),
+}));
+
+// No scope policy mock needed — scope validation has been removed.
+// The orchestrator uses requestedScopes directly or falls back to defaultScopes.
+
+// Provider store mock — configurable per test
+type ProviderRow = {
+  provider: string;
+  authorizeUrl: string;
+  tokenExchangeUrl: string;
+  refreshUrl: string | null;
+  tokenEndpointAuthMethod: string;
+  tokenExchangeBodyFormat: string;
+  userinfoUrl: string | null;
+  baseUrl: string | null;
+  defaultScopes: string;
+  availableScopes: string | null;
+  scopeSeparator: string;
+  authorizeParams: string | null;
+  pingUrl: string | null;
+  pingMethod: string | null;
+  pingHeaders: string | null;
+  pingBody: string | null;
+  revokeUrl: string | null;
+  revokeBodyTemplate: string | null;
+  managedServiceConfigKey: string | null;
+  displayLabel: string | null;
+  description: string | null;
+  dashboardUrl: string | null;
+  clientIdPlaceholder: string | null;
+  requiresClientSecret: number;
+  loopbackPort: number | null;
+  injectionTemplates: string | null;
+  appType: string | null;
+  setupNotes: string | null;
+  identityUrl: string | null;
+  identityMethod: string | null;
+  identityHeaders: string | null;
+  identityBody: string | null;
+  identityResponsePaths: string | null;
+  identityFormat: string | null;
+  identityOkField: string | null;
+  featureFlag: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+let mockProviderStore: Record<string, ProviderRow> = {};
+
+mock.module("../oauth/oauth-store.js", () => ({
+  getProvider: (key: string) => mockProviderStore[key],
+}));
+
+// Ingress mock — for gateway transport validation. The orchestrator passes
+// the real loaded config (seeded via setConfig below) into getPublicBaseUrl.
+mock.module("../inbound/public-ingress-urls.js", () => ({
+  getPublicBaseUrl: (config?: { ingress?: { publicBaseUrl?: string } }) => {
+    const url = config?.ingress?.publicBaseUrl ?? "";
+    if (!url) {
+      throw new Error("No public base URL configured.");
+    }
+    return url;
+  },
+}));
+
+// ---------------------------------------------------------------------------
+// Import module under test AFTER mocks are in place
+// ---------------------------------------------------------------------------
+
+import { orchestrateOAuthConnect } from "../oauth/connect-orchestrator.js";
+import { setOverridesForTesting } from "./feature-flag-test-helpers.js";
+import { setConfig } from "./helpers/set-config.js";
+
+/** Seed `ingress.publicBaseUrl` in the real workspace config. */
+function setPublicBaseUrl(url: string): void {
+  setConfig("ingress", { publicBaseUrl: url });
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makeProviderRow(
+  overrides: Partial<ProviderRow> & { provider: string },
+): ProviderRow {
+  const now = Date.now();
+  return {
+    authorizeUrl: "https://provider.example.com/authorize",
+    tokenExchangeUrl: "https://provider.example.com/token",
+    refreshUrl: null,
+    tokenEndpointAuthMethod: "client_secret_post",
+    tokenExchangeBodyFormat: "form",
+    userinfoUrl: null,
+    baseUrl: null,
+    defaultScopes: '["openid","email"]',
+    availableScopes: null,
+    scopeSeparator: " ",
+    authorizeParams: null,
+    pingUrl: null,
+    pingMethod: null,
+    pingHeaders: null,
+    pingBody: null,
+    revokeUrl: null,
+    revokeBodyTemplate: null,
+    managedServiceConfigKey: null,
+    displayLabel: null,
+    description: null,
+    dashboardUrl: null,
+    clientIdPlaceholder: null,
+    requiresClientSecret: 1,
+    loopbackPort: null,
+    injectionTemplates: null,
+    appType: null,
+    setupNotes: null,
+    identityUrl: null,
+    identityMethod: null,
+    identityHeaders: null,
+    identityBody: null,
+    identityResponsePaths: null,
+    identityFormat: null,
+    identityOkField: null,
+    featureFlag: null,
+    createdAt: now,
+    updatedAt: now,
+    ...overrides,
+  };
+}
+
+// Shared provider definitions used across tests
+const GOOGLE_PROVIDER = makeProviderRow({
+  provider: "google",
+  authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+  tokenExchangeUrl: "https://oauth2.googleapis.com/token",
+  loopbackPort: 17332,
+  displayLabel: "Google",
+});
+
+const OUTLOOK_PROVIDER = makeProviderRow({
+  provider: "outlook",
+  authorizeUrl:
+    "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+  tokenExchangeUrl:
+    "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+  loopbackPort: 17334,
+  displayLabel: "Outlook",
+});
+
+// ---------------------------------------------------------------------------
+// Reset state between tests
+// ---------------------------------------------------------------------------
+
+beforeEach(() => {
+  lastPrepareArgs = null;
+  lastStartArgs = null;
+  setPublicBaseUrl("");
+  mockIdentityResult = "user@example.com";
+  mockProviderStore = {};
+  setOverridesForTesting({});
+
+  mockPrepareResult = {
+    authorizeUrl: "https://provider.example.com/authorize?prepared",
+    state: "mock-state-123",
+    completion: new Promise(() => {}),
+  };
+
+  mockStartResult = {
+    tokens: { accessToken: "mock-access-token" },
+    grantedScopes: ["read", "write"],
+    rawTokenResponse: { access_token: "mock-access-token" },
+  };
+});
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe("orchestrateOAuthConnect — transport selection", () => {
+  // -------------------------------------------------------------------------
+  // Deferred (non-interactive) path
+  // -------------------------------------------------------------------------
+
+  describe("deferred (non-interactive) flow", () => {
+    test('callbackTransport: "loopback" → passes loopback options to prepareOAuth2Flow', async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+
+      const result = await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "loopback",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(result.deferred).toBe(true);
+
+      // Verify prepareOAuth2Flow received loopback options
+      expect(lastPrepareArgs).not.toBeNull();
+      expect(lastPrepareArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: 17332,
+      });
+    });
+
+    test('callbackTransport: "gateway" → passes gateway options to prepareOAuth2Flow', async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+      setPublicBaseUrl("https://gw.example.com");
+
+      const result = await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "gateway",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(result.deferred).toBe(true);
+
+      expect(lastPrepareArgs).not.toBeNull();
+      expect(lastPrepareArgs!.options).toEqual({
+        callbackTransport: "gateway",
+      });
+    });
+
+    test("callbackTransport omitted → defaults to loopback", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+
+      const result = await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: false,
+        // callbackTransport intentionally omitted
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(result.deferred).toBe(true);
+
+      expect(lastPrepareArgs).not.toBeNull();
+      expect(lastPrepareArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: 17332,
+      });
+    });
+
+    test("gateway without ingress configured → returns error", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+      setPublicBaseUrl(""); // no ingress
+
+      const result = await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "gateway",
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) {
+        return;
+      }
+      expect(result.error).toContain("public ingress URL");
+    });
+
+    test("loopback without ingress configured → succeeds", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+      setPublicBaseUrl(""); // no ingress
+
+      const result = await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "loopback",
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(result.deferred).toBe(true);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Interactive path
+  // -------------------------------------------------------------------------
+
+  describe("interactive flow", () => {
+    test('callbackTransport: "loopback" → passes loopback options to startOAuth2Flow', async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+
+      const result = await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: true,
+        callbackTransport: "loopback",
+        openUrl: () => {},
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(result.deferred).toBe(false);
+
+      expect(lastStartArgs).not.toBeNull();
+      expect(lastStartArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: 17332,
+      });
+    });
+
+    test('callbackTransport: "gateway" → passes gateway options to startOAuth2Flow', async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+
+      const result = await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: true,
+        callbackTransport: "gateway",
+        openUrl: () => {},
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(result.deferred).toBe(false);
+
+      expect(lastStartArgs).not.toBeNull();
+      expect(lastStartArgs!.options).toEqual({
+        callbackTransport: "gateway",
+      });
+    });
+
+    test("callbackTransport omitted → defaults to loopback", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+
+      const result = await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: true,
+        openUrl: () => {},
+        // callbackTransport intentionally omitted
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(result.deferred).toBe(false);
+
+      expect(lastStartArgs).not.toBeNull();
+      expect(lastStartArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: 17332,
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Provider x transport matrix — verifies the rule is universal
+  // -------------------------------------------------------------------------
+
+  describe("provider x transport matrix", () => {
+    test("Google + loopback → loopback transport with Google loopbackPort", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+
+      await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "loopback",
+      });
+
+      expect(lastPrepareArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: 17332,
+      });
+    });
+
+    test("Google + gateway → gateway transport", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+      setPublicBaseUrl("https://gw.example.com");
+
+      await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "gateway",
+      });
+
+      expect(lastPrepareArgs!.options).toEqual({
+        callbackTransport: "gateway",
+      });
+    });
+
+    test("Outlook + loopback → loopback transport with Outlook loopbackPort", async () => {
+      mockProviderStore["outlook"] = OUTLOOK_PROVIDER;
+
+      await orchestrateOAuthConnect({
+        service: "outlook",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "loopback",
+      });
+
+      expect(lastPrepareArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: 17334,
+      });
+    });
+
+    test("Outlook + gateway → gateway transport", async () => {
+      mockProviderStore["outlook"] = OUTLOOK_PROVIDER;
+      setPublicBaseUrl("https://gw.example.com");
+
+      await orchestrateOAuthConnect({
+        service: "outlook",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "gateway",
+      });
+
+      expect(lastPrepareArgs!.options).toEqual({
+        callbackTransport: "gateway",
+      });
+    });
+
+    test("Google + loopback (interactive) → loopback transport", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+
+      await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: true,
+        callbackTransport: "loopback",
+        openUrl: () => {},
+      });
+
+      expect(lastStartArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: 17332,
+      });
+    });
+
+    test("Google + gateway (interactive) → gateway transport", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+
+      await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: true,
+        callbackTransport: "gateway",
+        openUrl: () => {},
+      });
+
+      expect(lastStartArgs!.options).toEqual({
+        callbackTransport: "gateway",
+      });
+    });
+
+    test("Outlook + loopback (interactive) → loopback transport with Outlook loopbackPort", async () => {
+      mockProviderStore["outlook"] = OUTLOOK_PROVIDER;
+
+      await orchestrateOAuthConnect({
+        service: "outlook",
+        clientId: "client-id",
+        isInteractive: true,
+        callbackTransport: "loopback",
+        openUrl: () => {},
+      });
+
+      expect(lastStartArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: 17334,
+      });
+    });
+
+    test("Outlook + gateway (interactive) → gateway transport", async () => {
+      mockProviderStore["outlook"] = OUTLOOK_PROVIDER;
+
+      await orchestrateOAuthConnect({
+        service: "outlook",
+        clientId: "client-id",
+        isInteractive: true,
+        callbackTransport: "gateway",
+        openUrl: () => {},
+      });
+
+      expect(lastStartArgs!.options).toEqual({
+        callbackTransport: "gateway",
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Backward compatibility
+  // -------------------------------------------------------------------------
+
+  describe("backward compatibility", () => {
+    test("missing callbackTransport defaults to loopback (deferred, Google)", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+
+      const result = await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: false,
+      });
+
+      expect(result.success).toBe(true);
+      expect(lastPrepareArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: 17332,
+      });
+    });
+
+    test("missing callbackTransport defaults to loopback (deferred, Outlook)", async () => {
+      mockProviderStore["outlook"] = OUTLOOK_PROVIDER;
+
+      const result = await orchestrateOAuthConnect({
+        service: "outlook",
+        clientId: "client-id",
+        isInteractive: false,
+      });
+
+      expect(result.success).toBe(true);
+      expect(lastPrepareArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: 17334,
+      });
+    });
+
+    test("missing callbackTransport defaults to loopback (interactive, Google)", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+
+      const result = await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: true,
+        openUrl: () => {},
+      });
+
+      expect(result.success).toBe(true);
+      expect(lastStartArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: 17332,
+      });
+    });
+
+    test("missing callbackTransport defaults to loopback (interactive, Outlook)", async () => {
+      mockProviderStore["outlook"] = OUTLOOK_PROVIDER;
+
+      const result = await orchestrateOAuthConnect({
+        service: "outlook",
+        clientId: "client-id",
+        isInteractive: true,
+        openUrl: () => {},
+      });
+
+      expect(result.success).toBe(true);
+      expect(lastStartArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: 17334,
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Error cases
+  // -------------------------------------------------------------------------
+
+  describe("error cases", () => {
+    test("gateway without ingress (deferred, Google) → returns error", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+      setPublicBaseUrl("");
+
+      const result = await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "gateway",
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) {
+        return;
+      }
+      expect(result.error).toContain("public ingress URL");
+      // prepareOAuth2Flow should NOT have been called
+      expect(lastPrepareArgs).toBeNull();
+    });
+
+    test("gateway without ingress (deferred, Outlook) → returns error", async () => {
+      mockProviderStore["outlook"] = OUTLOOK_PROVIDER;
+      setPublicBaseUrl("");
+
+      const result = await orchestrateOAuthConnect({
+        service: "outlook",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "gateway",
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) {
+        return;
+      }
+      expect(result.error).toContain("public ingress URL");
+      expect(lastPrepareArgs).toBeNull();
+    });
+
+    test("unknown provider → returns error", async () => {
+      // No provider registered in the mock store
+
+      const result = await orchestrateOAuthConnect({
+        service: "unknown-provider",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "loopback",
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) {
+        return;
+      }
+      expect(result.error).toContain("No OAuth provider registered");
+      expect(result.error).toContain("unknown-provider");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Provider without loopbackPort
+  // -------------------------------------------------------------------------
+
+  describe("provider without loopbackPort", () => {
+    test("loopback transport passes undefined loopbackPort when provider has none", async () => {
+      mockProviderStore["custom"] = makeProviderRow({
+        provider: "custom",
+        loopbackPort: null, // no fixed port
+      });
+
+      await orchestrateOAuthConnect({
+        service: "custom",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "loopback",
+      });
+
+      expect(lastPrepareArgs!.options).toEqual({
+        callbackTransport: "loopback",
+        loopbackPort: undefined,
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Scope separator propagation
+  // -------------------------------------------------------------------------
+
+  describe("scope separator propagation", () => {
+    test("comma separator from providerRow propagates to oauthConfig (deferred)", async () => {
+      mockProviderStore["linear"] = makeProviderRow({
+        provider: "linear",
+        scopeSeparator: ",",
+      });
+
+      await orchestrateOAuthConnect({
+        service: "linear",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "loopback",
+      });
+
+      expect(lastPrepareArgs).not.toBeNull();
+      const capturedConfig = lastPrepareArgs!.config as {
+        scopeSeparator: string;
+      };
+      expect(capturedConfig.scopeSeparator).toBe(",");
+    });
+
+    test("space separator (default) from providerRow propagates to oauthConfig (deferred)", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+
+      await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: false,
+        callbackTransport: "loopback",
+      });
+
+      expect(lastPrepareArgs).not.toBeNull();
+      const capturedConfig = lastPrepareArgs!.config as {
+        scopeSeparator: string;
+      };
+      expect(capturedConfig.scopeSeparator).toBe(" ");
+    });
+
+    test("comma separator from providerRow propagates to oauthConfig (interactive)", async () => {
+      mockProviderStore["linear"] = makeProviderRow({
+        provider: "linear",
+        scopeSeparator: ",",
+      });
+
+      await orchestrateOAuthConnect({
+        service: "linear",
+        clientId: "client-id",
+        isInteractive: true,
+        callbackTransport: "loopback",
+        openUrl: () => {},
+      });
+
+      expect(lastStartArgs).not.toBeNull();
+      const capturedConfig = lastStartArgs!.config as {
+        scopeSeparator: string;
+      };
+      expect(capturedConfig.scopeSeparator).toBe(",");
+    });
+
+    test("space separator from providerRow propagates to oauthConfig (interactive)", async () => {
+      mockProviderStore["google"] = GOOGLE_PROVIDER;
+
+      await orchestrateOAuthConnect({
+        service: "google",
+        clientId: "client-id",
+        isInteractive: true,
+        callbackTransport: "loopback",
+        openUrl: () => {},
+      });
+
+      expect(lastStartArgs).not.toBeNull();
+      const capturedConfig = lastStartArgs!.config as {
+        scopeSeparator: string;
+      };
+      expect(capturedConfig.scopeSeparator).toBe(" ");
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Feature-flag gating
+// ---------------------------------------------------------------------------
+
+/**
+ * A provider whose seed entry declares a `featureFlag` is only connectable
+ * while that flag is enabled. The orchestrator is the shared choke point for
+ * every connect path (runtime routes, gateway, CLI, credential vault tool),
+ * so the gate lives here rather than in each entry point.
+ */
+describe("orchestrateOAuthConnect — feature-flag gating", () => {
+  const GATED_PROVIDER = makeProviderRow({
+    provider: "gated",
+    displayLabel: "Gated",
+    loopbackPort: 17399,
+    featureFlag: "gated-provider-flag",
+  });
+
+  test("refuses to connect a gated provider when its flag is disabled", async () => {
+    mockProviderStore["gated"] = GATED_PROVIDER;
+    setOverridesForTesting({ "gated-provider-flag": false });
+
+    const result = await orchestrateOAuthConnect({
+      service: "gated",
+      clientId: "client-id",
+      isInteractive: false,
+      callbackTransport: "loopback",
+    });
+
+    expect(result.success).toBe(false);
+    // No authorization flow may be started for a gated provider.
+    expect(lastPrepareArgs).toBeNull();
+    expect(lastStartArgs).toBeNull();
+  });
+
+  test("gated provider is indistinguishable from an unregistered one", async () => {
+    mockProviderStore["gated"] = GATED_PROVIDER;
+    setOverridesForTesting({ "gated-provider-flag": false });
+
+    const gated = await orchestrateOAuthConnect({
+      service: "gated",
+      clientId: "client-id",
+      isInteractive: false,
+      callbackTransport: "loopback",
+    });
+    const absent = await orchestrateOAuthConnect({
+      service: "not-a-provider",
+      clientId: "client-id",
+      isInteractive: false,
+      callbackTransport: "loopback",
+    });
+
+    expect(gated.success).toBe(false);
+    expect(absent.success).toBe(false);
+    if (gated.success || absent.success) {
+      return;
+    }
+    // Identical wording so the gate does not leak that the provider exists.
+    expect(gated.error).toBe(absent.error.replace("not-a-provider", "gated"));
+  });
+
+  test("connects a gated provider once its flag is enabled", async () => {
+    mockProviderStore["gated"] = GATED_PROVIDER;
+    setOverridesForTesting({ "gated-provider-flag": true });
+
+    const result = await orchestrateOAuthConnect({
+      service: "gated",
+      clientId: "client-id",
+      isInteractive: false,
+      callbackTransport: "loopback",
+    });
+
+    expect(result.success).toBe(true);
+    expect(lastPrepareArgs).not.toBeNull();
+  });
+
+  test("leaves ungated providers connectable", async () => {
+    mockProviderStore["google"] = GOOGLE_PROVIDER;
+    setOverridesForTesting({});
+
+    const result = await orchestrateOAuthConnect({
+      service: "google",
+      clientId: "client-id",
+      isInteractive: false,
+      callbackTransport: "loopback",
+    });
+
+    expect(GOOGLE_PROVIDER.featureFlag).toBeNull();
+    expect(result.success).toBe(true);
+    expect(lastPrepareArgs).not.toBeNull();
+  });
+});

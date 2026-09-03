@@ -1,0 +1,378 @@
+/**
+ * Tests for Slack inbound trusted contact verification.
+ *
+ * When an unknown Slack user messages the bot, the system should:
+ * 1. Create an outbound verification session bound to the user's identity
+ * 2. Send the verification code to the user's DM via the gateway
+ * 3. Reply in the original channel telling the user to check their DMs
+ * 4. Notify the guardian of the access attempt
+ * 5. When the user replies with the code in the DM, verify and activate
+ */
+import { beforeEach, describe, expect, mock, test } from "bun:test";
+
+// ---------------------------------------------------------------------------
+// Test isolation: in-memory SQLite via temp directory
+// ---------------------------------------------------------------------------
+
+mock.module("../config/env.js", () => ({
+  isHttpAuthDisabled: () => true,
+  getGatewayInternalBaseUrl: () => "http://127.0.0.1:7830",
+}));
+
+// Track emitNotificationSignal calls
+const emitSignalCalls: Array<Record<string, unknown>> = [];
+mock.module("../notifications/emit-signal.js", () => ({
+  emitNotificationSignal: async (params: Record<string, unknown>) => {
+    emitSignalCalls.push(params);
+    return {
+      signalId: "mock-signal-id",
+      deduplicated: false,
+      dispatched: true,
+      reason: "mock",
+      deliveryResults: [],
+    };
+  },
+}));
+
+// Track deliverChannelReply calls
+const deliverReplyCalls: Array<{
+  url: string;
+  payload: Record<string, unknown>;
+}> = [];
+mock.module("../runtime/gateway-client.js", () => ({
+  deliverChannelReply: async (
+    url: string,
+    payload: Record<string, unknown>,
+  ) => {
+    deliverReplyCalls.push({ url, payload });
+  },
+}));
+
+// Guardian identity resolves via the gateway delivery reader, not the local
+// contacts DB. Seed it to mirror the createGuardianBinding calls below.
+interface GatewayGuardian {
+  channelType: string;
+  contactId: string;
+  principalId?: string | null;
+  displayName?: string | null;
+  address: string;
+  externalChatId?: string | null;
+  status: string;
+  verifiedAt?: number | null;
+}
+let gatewayGuardians: GatewayGuardian[] = [];
+mock.module("../contacts/guardian-delivery-reader.js", () => ({
+  getGuardianDelivery: async () => gatewayGuardians,
+  guardianForChannel: (list: GatewayGuardian[], channelType: string) =>
+    list.find((g) => g.channelType === channelType && g.status === "active"),
+}));
+
+function seedGatewayGuardian(
+  g: Partial<GatewayGuardian> & { channelType: string; address: string },
+): void {
+  gatewayGuardians.push({
+    contactId: `c-${g.channelType}`,
+    status: "active",
+    ...g,
+  });
+}
+
+import { getDb } from "../persistence/db-connection.js";
+import { initializeDb } from "../persistence/db-init.js";
+import {
+  handleChannelInbound,
+  seedContactChannel,
+} from "./helpers/channel-test-adapter.js";
+import { createGuardianBinding } from "./helpers/create-guardian-binding.js";
+import { bridgeState } from "./helpers/gateway-guardian-requests-store-bridge.js";
+import {
+  createOutboundSession,
+  createOutboundSessionGuarded,
+  findActiveSession,
+  getPendingSession,
+  resetVerificationSessionsSim,
+} from "./helpers/verification-sessions-ipc-sim.js";
+
+// The inbound stages read/write sessions via the gateway-backed IPC client;
+// delegate it to the in-memory sim so this suite keeps exercising the full
+// challenge-offer/dedup matrix without a live gateway.
+mock.module("../channels/gateway-verification-sessions.js", () => ({
+  createOutboundSession: async (
+    params: Parameters<typeof createOutboundSession>[0],
+  ) => createOutboundSession(params),
+  createOutboundSessionConditional: async (
+    params: Parameters<typeof createOutboundSessionGuarded>[0],
+  ) => createOutboundSessionGuarded(params),
+  getPendingSession: async (channel: string) => getPendingSession(channel),
+  findActiveSession: async (
+    channel: string,
+    filter?: Parameters<typeof findActiveSession>[1],
+  ) => findActiveSession(channel, filter),
+}));
+
+await initializeDb();
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const TEST_BEARER_TOKEN = "test-token";
+
+function resetState(): void {
+  resetVerificationSessionsSim();
+  bridgeState.reset();
+  const db = getDb();
+  db.run("DELETE FROM channel_inbound_events");
+  db.run("DELETE FROM conversations");
+  db.run("DELETE FROM notification_events");
+  db.run("DELETE FROM contact_channels");
+  db.run("DELETE FROM contacts");
+  gatewayGuardians = [];
+  // Seed the vellum guardian binding (gateway does this at startup in
+  // production). The gateway list is the source of truth for guardian
+  // resolution; the DB write mirrors it for any local INFO reads.
+  seedGatewayGuardian({
+    channelType: "vellum",
+    address: "guardian-principal",
+    principalId: "guardian-principal",
+    displayName: "guardian-principal",
+  });
+  createGuardianBinding({
+    channel: "vellum",
+    guardianExternalUserId: "guardian-principal",
+    guardianDeliveryChatId: "local",
+    guardianPrincipalId: "guardian-principal",
+    verifiedVia: "bootstrap",
+  });
+  emitSignalCalls.length = 0;
+  deliverReplyCalls.length = 0;
+}
+
+function buildSlackInboundRequest(
+  overrides: Record<string, unknown> = {},
+): Request {
+  const body: Record<string, unknown> = {
+    sourceChannel: "slack",
+    interface: "slack",
+    conversationExternalId: "C0123CHANNEL",
+    externalMessageId: `msg-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`,
+    content: "Hello, can I use this assistant?",
+    actorExternalId: "U0123UNKNOWN",
+    actorDisplayName: "Alice Unknown",
+    actorUsername: "alice_unknown",
+    replyCallbackUrl: "http://localhost:7830/deliver/slack",
+    ...overrides,
+  };
+
+  return new Request("http://localhost:8080/channels/inbound", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Gateway-Origin": TEST_BEARER_TOKEN,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe("Slack inbound trusted contact verification", () => {
+  beforeEach(() => {
+    resetState();
+  });
+
+  test("unknown Slack user receives verification challenge via DM", async () => {
+    const req = buildSlackInboundRequest();
+    const resp = await handleChannelInbound(req, undefined, TEST_BEARER_TOKEN);
+    const json = (await resp.json()) as Record<string, unknown>;
+
+    expect(json.denied).toBe(true);
+    expect(json.reason).toBe("verification_challenge_sent");
+    expect(json.verificationSessionId).toBeDefined();
+
+    // Verification code is NOT sent to the requester — only the guardian
+    // receives it via the access request notification flow
+
+    // Channel reply tells user they're not recognized yet
+    expect(deliverReplyCalls.length).toBe(1);
+    expect(
+      (deliverReplyCalls[0].payload as Record<string, unknown>).text,
+    ).toContain("I don't recognize you yet");
+  });
+
+  test("a blocked (revoked) Slack contact gets no challenge and no guardian re-prompt", async () => {
+    // "Block" persists a `revoked` contact — a durable keep-out. On re-contact
+    // the sender must NOT get a fresh (unusable) self-verify challenge, and the
+    // guardian must NOT be re-notified: they already decided to keep this
+    // contact out, and blocking is how the prompts are stopped.
+    seedContactChannel({
+      sourceChannel: "slack",
+      externalUserId: "U0123UNKNOWN",
+      displayName: "Alice Unknown",
+      status: "revoked",
+    });
+
+    const resp = await handleChannelInbound(
+      buildSlackInboundRequest(),
+      undefined,
+      TEST_BEARER_TOKEN,
+    );
+    const json = (await resp.json()) as Record<string, unknown>;
+
+    // Kept out at the door, with no re-engagement side effects.
+    expect(json.denied).toBe(true);
+    expect(json.reason).toBe("member_revoked");
+    expect(json.verificationSessionId).toBeUndefined();
+    expect(findActiveSession("slack")).toBeNull();
+    expect(emitSignalCalls.length).toBe(0);
+  });
+
+  test("a left-unverified Slack contact is re-challenged when it messages on a trust-gated channel", async () => {
+    // "Leave unverified" parks the sender as an `unverified` contact — a
+    // neutral park, NOT a keep-out. A later message on a channel that needs
+    // trust (the default `trusted_contacts` floor) re-fires the flow: a fresh
+    // self-verify challenge for the sender and a fresh card for the guardian.
+    // This is the D1 behavior — a parked contact is never silently dead-ended.
+    seedContactChannel({
+      sourceChannel: "slack",
+      externalUserId: "U0123UNKNOWN",
+      displayName: "Alice Unknown",
+      status: "unverified",
+    });
+
+    const resp = await handleChannelInbound(
+      buildSlackInboundRequest({
+        sourceMetadata: { admissionPolicy: "trusted_contacts" },
+      }),
+      undefined,
+      TEST_BEARER_TOKEN,
+    );
+    const json = (await resp.json()) as Record<string, unknown>;
+
+    // Re-fired: fresh challenge minted + guardian re-notified.
+    expect(json.denied).toBe(true);
+    expect(json.reason).toBe("verification_challenge_sent");
+    expect(json.verificationSessionId).toBeDefined();
+    expect(findActiveSession("slack")).not.toBeNull();
+    expect(emitSignalCalls.length).toBe(1);
+  });
+
+  test("verification session is identity-bound to the Slack user", async () => {
+    const req = buildSlackInboundRequest();
+    await handleChannelInbound(req, undefined, TEST_BEARER_TOKEN);
+
+    // An active outbound session should exist for the slack channel
+    const session = findActiveSession("slack");
+    expect(session).not.toBeNull();
+    expect(session!.expectedExternalUserId).toBe("U0123UNKNOWN");
+    expect(session!.expectedChatId).toBe("U0123UNKNOWN");
+    expect(session!.identityBindingStatus).toBe("bound");
+    expect(session!.verificationPurpose).toBe("trusted_contact");
+  });
+
+  test("guardian is notified of the access attempt alongside verification", async () => {
+    // Set up a guardian binding so the notification can target it. The gateway
+    // list resolves guardian identity; the DB write mirrors it.
+    seedGatewayGuardian({
+      channelType: "slack",
+      address: "U_GUARDIAN",
+      externalChatId: "D_GUARDIAN_DM",
+      principalId: "guardian-principal",
+    });
+    createGuardianBinding({
+      channel: "slack",
+      guardianExternalUserId: "U_GUARDIAN",
+      guardianDeliveryChatId: "D_GUARDIAN_DM",
+      guardianPrincipalId: "guardian-principal",
+      verifiedVia: "test",
+    });
+
+    const req = buildSlackInboundRequest();
+    await handleChannelInbound(req, undefined, TEST_BEARER_TOKEN);
+
+    // Guardian should have been notified
+    expect(emitSignalCalls.length).toBe(1);
+    expect(emitSignalCalls[0].sourceEventName).toBe("ingress.access_request");
+    expect(emitSignalCalls[0].sourceChannel).toBe("slack");
+  });
+
+  test("duplicate challenge is not sent when session already exists", async () => {
+    // First message creates the session
+    const req1 = buildSlackInboundRequest();
+    const resp1 = await handleChannelInbound(
+      req1,
+      undefined,
+      TEST_BEARER_TOKEN,
+    );
+    const json1 = (await resp1.json()) as Record<string, unknown>;
+    expect(json1.reason).toBe("verification_challenge_sent");
+
+    // Second message from the same user — session already exists, so
+    // falls through to standard deny path
+    const req2 = buildSlackInboundRequest({
+      externalMessageId: `msg-${Date.now()}-second`,
+    });
+    const resp2 = await handleChannelInbound(
+      req2,
+      undefined,
+      TEST_BEARER_TOKEN,
+    );
+    const json2 = (await resp2.json()) as Record<string, unknown>;
+    expect(json2.denied).toBe(true);
+    expect(json2.reason).toBe("not_a_member");
+
+    // No DM was sent at all
+  });
+
+  test("different Slack user is not suppressed by existing session for another user", async () => {
+    // First message from user A creates a session
+    const req1 = buildSlackInboundRequest({
+      actorExternalId: "U_USER_A",
+      actorDisplayName: "User A",
+    });
+    const resp1 = await handleChannelInbound(
+      req1,
+      undefined,
+      TEST_BEARER_TOKEN,
+    );
+    const json1 = (await resp1.json()) as Record<string, unknown>;
+    expect(json1.reason).toBe("verification_challenge_sent");
+
+    // Second message from user B — should get their own challenge
+    const req2 = buildSlackInboundRequest({
+      actorExternalId: "U_USER_B",
+      actorDisplayName: "User B",
+      externalMessageId: `msg-${Date.now()}-user-b`,
+    });
+    const resp2 = await handleChannelInbound(
+      req2,
+      undefined,
+      TEST_BEARER_TOKEN,
+    );
+    const json2 = (await resp2.json()) as Record<string, unknown>;
+    expect(json2.reason).toBe("verification_challenge_sent");
+    expect(json2.verificationSessionId).toBeDefined();
+
+    // No DMs sent to requesters — guardian gets code via notification flow
+  });
+
+  test("non-Slack channels still use standard access request flow", async () => {
+    const req = buildSlackInboundRequest({
+      sourceChannel: "telegram",
+      interface: "telegram",
+      replyCallbackUrl: "http://localhost:7830/deliver/telegram",
+    });
+    const resp = await handleChannelInbound(req, undefined, TEST_BEARER_TOKEN);
+    const json = (await resp.json()) as Record<string, unknown>;
+
+    // Standard deny path — no verification challenge
+    expect(json.denied).toBe(true);
+    expect(json.reason).toBe("not_a_member");
+
+    // No Slack DM was sent
+  });
+});

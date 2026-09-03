@@ -1,0 +1,370 @@
+/**
+ * Tests for the deterministic verification control plane (M1).
+ *
+ * Verifies that:
+ * 1. Verification control messages (code replies, /start gv_<token>) never invoke
+ *    the normal message pipeline — they produce only template-driven copy.
+ * 2. Call session mode metadata is persisted correctly for guardian verification calls.
+ * 3. Channel verification reply templates are non-empty and deterministic.
+ */
+
+import { beforeEach, describe, expect, mock, test } from "bun:test";
+
+// ---------------------------------------------------------------------------
+// Test isolation: in-memory SQLite via temp directory
+// ---------------------------------------------------------------------------
+
+mock.module("../config/env.js", () => ({
+  isHttpAuthDisabled: () => true,
+  getGatewayInternalBaseUrl: () => "http://127.0.0.1:7830",
+}));
+
+// Track whether processMessage is called (guards against agent loop invocation).
+// The real processMessage is now a direct import inside inbound-message-handler,
+// so we mock the module to intercept it.
+let _processMessageCalled = false;
+
+mock.module("../daemon/approval-generators.js", () => ({
+  createApprovalCopyGenerator: () => undefined,
+  createApprovalConversationGenerator: () => undefined,
+}));
+
+mock.module("../daemon/process-message.js", () => ({
+  processMessage: async (..._args: unknown[]) => {
+    _processMessageCalled = true;
+    return { messageId: "mock-msg" };
+  },
+  processMessageInBackground: async () => ({ messageId: "mock-bg" }),
+  // Re-export other functions as pass-through stubs; only processMessage
+  // is imported by inbound-message-handler.
+  resolveTurnChannel: () => "telegram",
+  resolveTurnInterface: () => "telegram",
+  prepareConversationForMessage: async () => ({}),
+}));
+
+// ---------------------------------------------------------------------------
+// Imports (after mocks)
+// ---------------------------------------------------------------------------
+
+import { initializeDb } from "../persistence/db-init.js";
+import { handleChannelInbound } from "../runtime/routes/inbound-message-handler.js";
+import {
+  composeChannelVerifyReply,
+  GUARDIAN_VERIFY_TEMPLATE_KEYS,
+} from "../runtime/verification-templates.js";
+import {
+  bindSessionIdentity,
+  createOutboundSession,
+  createOutboundSessionGuarded,
+  resolveBootstrapToken,
+  updateSessionDelivery,
+  updateSessionStatus,
+} from "./helpers/verification-sessions-ipc-sim.js";
+
+// The inbound stages read/write sessions via the gateway-backed IPC client;
+// delegate it to the in-memory sim so the bootstrap flow keeps running
+// without a live gateway.
+mock.module("../channels/gateway-verification-sessions.js", () => ({
+  resolveBootstrapToken: async (channel: string, token: string) =>
+    resolveBootstrapToken(channel, token),
+  bindSessionIdentity: async (
+    id: string,
+    externalUserId: string,
+    chatId: string,
+  ) => bindSessionIdentity(id, externalUserId, chatId),
+  updateSessionStatus: async (
+    ...args: Parameters<typeof updateSessionStatus>
+  ) => updateSessionStatus(...args),
+  createOutboundSession: async (
+    params: Parameters<typeof createOutboundSession>[0],
+  ) => createOutboundSession(params),
+  createOutboundSessionConditional: async (
+    params: Parameters<typeof createOutboundSessionGuarded>[0],
+  ) => createOutboundSessionGuarded(params),
+  updateSessionDelivery: async (
+    ...args: Parameters<typeof updateSessionDelivery>
+  ) => updateSessionDelivery(...args),
+}));
+
+// ---------------------------------------------------------------------------
+// Template tests: channel verification reply templates are deterministic
+// ---------------------------------------------------------------------------
+
+describe("Channel verification reply templates", () => {
+  test("success template returns non-empty deterministic string", () => {
+    const result = composeChannelVerifyReply(
+      GUARDIAN_VERIFY_TEMPLATE_KEYS.CHANNEL_VERIFY_SUCCESS,
+    );
+    expect(typeof result).toBe("string");
+    expect(result.length).toBeGreaterThan(0);
+    // Calling again yields the same string (deterministic)
+    expect(
+      composeChannelVerifyReply(
+        GUARDIAN_VERIFY_TEMPLATE_KEYS.CHANNEL_VERIFY_SUCCESS,
+      ),
+    ).toBe(result);
+  });
+
+  test("failure template returns non-empty deterministic string", () => {
+    const result = composeChannelVerifyReply(
+      GUARDIAN_VERIFY_TEMPLATE_KEYS.CHANNEL_VERIFY_FAILED,
+    );
+    expect(typeof result).toBe("string");
+    expect(result.length).toBeGreaterThan(0);
+  });
+
+  test("failure template uses provided failureReason", () => {
+    const reason = "The verification code is invalid or has expired.";
+    const result = composeChannelVerifyReply(
+      GUARDIAN_VERIFY_TEMPLATE_KEYS.CHANNEL_VERIFY_FAILED,
+      {
+        failureReason: reason,
+      },
+    );
+    expect(result).toBe(reason);
+  });
+
+  test("bootstrap bound template returns non-empty deterministic string", () => {
+    const result = composeChannelVerifyReply(
+      GUARDIAN_VERIFY_TEMPLATE_KEYS.CHANNEL_BOOTSTRAP_BOUND,
+    );
+    expect(typeof result).toBe("string");
+    expect(result.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Call session mode metadata: createCallSession persists callMode
+// ---------------------------------------------------------------------------
+
+describe("Call session mode metadata", () => {
+  // Cold DB init runs every migration; give it headroom over Bun's 5s default
+  // hook timeout so a loaded CI runner doesn't trip it.
+  beforeEach(async () => {
+    await initializeDb();
+  }, 30_000);
+
+  test("createCallSession persists callMode and verificationSessionId", async () => {
+    // Dynamic import to avoid circular dependency issues
+    const { createCallSession, getCallSession } =
+      await import("../calls/call-store.js");
+    const { getOrCreateConversation } =
+      await import("../persistence/conversation-key-store.js");
+
+    const { conversationId } = getOrCreateConversation("test-conv-mode");
+    const session = createCallSession({
+      conversationId,
+      provider: "twilio",
+      fromNumber: "+15551234567",
+      toNumber: "+15559876543",
+      callMode: "verification",
+      verificationSessionId: "gv-session-test",
+    });
+
+    expect(session.callMode).toBe("verification");
+    expect(session.verificationSessionId).toBe("gv-session-test");
+
+    // Verify it persists to DB
+    const loaded = getCallSession(session.id);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.callMode).toBe("verification");
+    expect(loaded!.verificationSessionId).toBe("gv-session-test");
+  });
+
+  test("createCallSession defaults callMode to null when not provided", async () => {
+    const { createCallSession, getCallSession } =
+      await import("../calls/call-store.js");
+    const { getOrCreateConversation } =
+      await import("../persistence/conversation-key-store.js");
+
+    const { conversationId } = getOrCreateConversation(
+      "test-conv-mode-default",
+    );
+    const session = createCallSession({
+      conversationId,
+      provider: "twilio",
+      fromNumber: "+15551234567",
+      toNumber: "+15559876543",
+    });
+
+    expect(session.callMode).toBeNull();
+    expect(session.verificationSessionId).toBeNull();
+
+    const loaded = getCallSession(session.id);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.callMode).toBeNull();
+    expect(loaded!.verificationSessionId).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Guard test: verification commands must not reach processMessage
+// ---------------------------------------------------------------------------
+
+describe("Verification control messages are deterministic (guard)", () => {
+  beforeEach(async () => {
+    await initializeDb();
+  }, 30_000);
+
+  test("handleChannelInbound does not call processMessage for /start gv_<token> bootstrap commands", async () => {
+    const { createHash, randomBytes } = await import("node:crypto");
+
+    const { createOutboundSession } =
+      await import("./helpers/verification-sessions-ipc-sim.js");
+
+    // Generate a bootstrap token and create a pending_bootstrap session
+    const bootstrapToken = randomBytes(16).toString("hex");
+    const bootstrapTokenHash = createHash("sha256")
+      .update(bootstrapToken)
+      .digest("hex");
+
+    createOutboundSession({
+      channel: "telegram",
+      identityBindingStatus: "pending_bootstrap",
+      destinationAddress: "test_user",
+      bootstrapTokenHash,
+    });
+
+    _processMessageCalled = false;
+
+    // Track channel replies (the handler delivers the verification code via fetch)
+    const deliveredReplies: Array<{ chatId: string; text: string }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const _url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      if (init?.method === "POST" && init.body) {
+        try {
+          const body = JSON.parse(init.body as string);
+          if (body.chatId && body.text) {
+            deliveredReplies.push({ chatId: body.chatId, text: body.text });
+          }
+        } catch {
+          /* not JSON */
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      return originalFetch(input, init as never);
+    }) as unknown as typeof fetch;
+
+    try {
+      const req = new Request("http://localhost/channels/inbound", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sourceChannel: "telegram",
+          interface: "telegram",
+          conversationExternalId: "chat-bootstrap-123",
+          externalMessageId: `msg-bootstrap-${Date.now()}`,
+          content: `/start gv_${bootstrapToken}`,
+          actorExternalId: "user-bootstrap-123",
+          actorDisplayName: "Bootstrap User",
+          replyCallbackUrl: "http://localhost/callback",
+          sourceMetadata: {
+            commandIntent: { type: "start", payload: `gv_${bootstrapToken}` },
+            // Gateway stamps a stranger verdict for this not-yet-bound user;
+            // the bootstrap intercept still fires for a present stranger.
+            trustVerdict: {
+              trustClass: "unknown",
+              canonicalSenderId: "user-bootstrap-123",
+            },
+          },
+        }),
+      });
+
+      const response = await handleChannelInbound({
+        body: JSON.parse(await req.text()),
+      });
+      const body = response as Record<string, unknown>;
+
+      // Bootstrap should have been handled deterministically
+      expect(body.verificationOutcome).toBe("bootstrap_bound");
+      expect(body.accepted).toBe(true);
+
+      // processMessage must NOT have been called — deterministic handling
+      expect(_processMessageCalled).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("handleChannelInbound does not allow blocked members to bootstrap with /start gv_<token>", async () => {
+    const { createHash, randomBytes } = await import("node:crypto");
+
+    const { createOutboundSession } =
+      await import("./helpers/verification-sessions-ipc-sim.js");
+    const { upsertContactChannel } =
+      await import("../contacts/contacts-write.js");
+
+    const blockedIdentity = {
+      sourceChannel: "telegram",
+      externalUserId: "user-blocked-bootstrap",
+      externalChatId: "chat-blocked-bootstrap",
+      displayName: "Blocked Bootstrap User",
+      status: "blocked",
+      policy: "deny",
+    } as const;
+    upsertContactChannel(blockedIdentity);
+
+    const bootstrapToken = randomBytes(16).toString("hex");
+    const bootstrapTokenHash = createHash("sha256")
+      .update(bootstrapToken)
+      .digest("hex");
+
+    createOutboundSession({
+      channel: "telegram",
+      identityBindingStatus: "pending_bootstrap",
+      destinationAddress: blockedIdentity.externalUserId,
+      bootstrapTokenHash,
+    });
+
+    _processMessageCalled = false;
+
+    const req = new Request("http://localhost/channels/inbound", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sourceChannel: "telegram",
+        interface: "telegram",
+        conversationExternalId: blockedIdentity.externalChatId,
+        externalMessageId: `msg-blocked-bootstrap-${Date.now()}`,
+        content: `/start gv_${bootstrapToken}`,
+        actorExternalId: blockedIdentity.externalUserId,
+        actorDisplayName: blockedIdentity.displayName,
+        sourceMetadata: {
+          commandIntent: { type: "start", payload: `gv_${bootstrapToken}` },
+          // Gateway stamps the member verdict surfacing the blocked status; the
+          // ACL hard-deny fires before the bootstrap intercept.
+          trustVerdict: {
+            trustClass: "unknown",
+            canonicalSenderId: blockedIdentity.externalUserId,
+            contactId: "contact-blocked-bootstrap",
+            channelId: "channel-blocked-bootstrap",
+            type: blockedIdentity.sourceChannel,
+            address: blockedIdentity.externalUserId,
+            status: blockedIdentity.status,
+            policy: blockedIdentity.policy,
+          },
+        },
+      }),
+    });
+
+    const response = await handleChannelInbound({
+      body: JSON.parse(await req.text()),
+    });
+    const body = response as Record<string, unknown>;
+
+    expect(body.accepted).toBe(true);
+    expect(body.denied).toBe(true);
+    expect(body.reason).toBe("member_blocked");
+    expect(body.verificationOutcome).toBeUndefined();
+    expect(_processMessageCalled).toBe(false);
+  });
+});

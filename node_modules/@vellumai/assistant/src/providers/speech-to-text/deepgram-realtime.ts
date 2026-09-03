@@ -1,0 +1,1376 @@
+/**
+ * Deepgram realtime streaming STT adapter.
+ *
+ * Opens a WebSocket session against Deepgram's live transcription endpoint
+ * (`/v1/listen`), forwards PCM audio frames from the caller, and normalizes
+ * Deepgram's streaming response payloads (`is_final`, `speech_final`,
+ * endpointing metadata) into the daemon's {@link SttStreamServerEvent}
+ * contract with stable partial/final semantics.
+ *
+ * Lifecycle:
+ * 1. {@link start} opens the WebSocket and resolves once the connection is
+ *    established.
+ * 2. {@link sendAudio} forwards audio chunks over the open socket with
+ *    backpressure-safe bufferedAmount checks.
+ * 3. {@link finalizeUtterance} sends the Deepgram `Finalize` message to
+ *    flush provider-buffered audio into finals without closing the
+ *    stream; the flush completion is signalled with a `finalized` event.
+ * 4. {@link stop} sends the Deepgram `CloseStream` message and waits for
+ *    the provider to flush any remaining finals before closing.
+ * 5. The `onEvent` callback receives `partial`, `final`, `finalized`,
+ *    `error`, and `closed` events throughout the session lifetime.
+ *
+ * Error handling:
+ * - Provider WebSocket errors and unexpected closes are mapped to
+ *   {@link SttStreamServerErrorEvent} with appropriate categories.
+ * - A configurable inactivity timeout fires a `closed` event if the
+ *   provider stops responding to audio mid-session; an idle stream with
+ *   no audio owed a response never times out.
+ * - All timers and listeners are cleaned up on close to prevent leaks.
+ */
+
+import { rankLanguages } from "../../stt/language-metadata.js";
+import type {
+  StreamingTranscriber,
+  SttStreamServerEvent,
+} from "../../stt/types.js";
+import { baseLanguageSubtag } from "../../util/language-subtag.js";
+import { getLogger } from "../../util/logger.js";
+
+const log = getLogger("deepgram-realtime");
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const DEFAULT_WS_BASE_URL = "wss://api.deepgram.com";
+const DEFAULT_MODEL = "nova-2";
+
+/**
+ * Default timeout (ms) for the WebSocket connection handshake.
+ * If the socket does not reach OPEN within this window, start() rejects.
+ */
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+
+/**
+ * Default inactivity timeout (ms). If audio has been sent but no message
+ * comes back from Deepgram for this long, the adapter closes with a
+ * timeout error. This guards against provider-side hangs. A stream with
+ * no audio awaiting a response (e.g. mic gated while the assistant
+ * speaks) is legitimately silent and never times out.
+ */
+const DEFAULT_INACTIVITY_TIMEOUT_MS = 30_000;
+
+/**
+ * Default interval (ms) for emitting Deepgram `KeepAlive` control frames
+ * during silent stretches. Deepgram's server-side timeout closes the
+ * socket if no real audio content arrives for ~10s; raw silence PCM does
+ * not reset that timer, only an explicit `{"type":"KeepAlive"}` message
+ * does. Sending one every 5s keeps the socket alive through arbitrary
+ * pauses (think: 1:1 voice mode while the user is thinking) without any
+ * meaningful bandwidth cost.
+ */
+const DEFAULT_KEEPALIVE_INTERVAL_MS = 5_000;
+
+/**
+ * Maximum WebSocket bufferedAmount (bytes) before sendAudio applies
+ * backpressure by dropping frames. This prevents unbounded memory growth
+ * if the network or provider cannot keep up with the audio rate.
+ */
+const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1 MiB
+
+/**
+ * Grace period (ms) after sending CloseStream before we force-close
+ * the WebSocket. Gives Deepgram time to flush any remaining finals.
+ */
+const CLOSE_GRACE_MS = 5_000;
+
+/**
+ * Grace period (ms) after sending Finalize before the adapter emits
+ * `finalized` on its own. Deepgram sends no `from_finalize` Results frame
+ * when it has no significant audio buffered, so a caller waiting on the
+ * completion signal would otherwise stall indefinitely.
+ */
+const FINALIZE_FALLBACK_MS = 2_000;
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+export interface DeepgramRealtimeOptions {
+  /** Deepgram model to use (default: "nova-2"). */
+  model?: string;
+  /**
+   * BCP-47 language code (e.g. "en", "es"), or "multi" for nova-3
+   * code-switching across English, Spanish, French, German, Hindi, Russian,
+   * Portuguese, Japanese, Italian, and Dutch.
+   *
+   * Omitted by default, which Deepgram decodes as English, NOT as
+   * auto-detection. Non-English audio sent without this comes back as
+   * English-sounding nonsense rather than an error.
+   */
+  language?: string;
+  /** Enable Deepgram smart formatting (punctuation, numerals, etc.). Default: true. */
+  smartFormatting?: boolean;
+  /** Enable interim (partial) results. Default: true. */
+  interimResults?: boolean;
+  /** Enable utterance end detection (endpointing). Default: true. */
+  utteranceEndMs?: number;
+  /** Override the Deepgram WebSocket base URL (useful for proxies or on-prem). */
+  baseUrl?: string;
+  /**
+   * Override the WebSocket path (default: "/v1/listen"). Relays expose the
+   * same wire protocol on their own routes.
+   */
+  path?: string;
+  /**
+   * Send the API key as a `?key=` query parameter instead of the
+   * `Authorization: Token` header. The velay speech relay accepts query
+   * auth; it does not accept Deepgram's `Token` scheme. Default: false.
+   */
+  queryAuth?: boolean;
+  /**
+   * Omit the `model` query parameter. The velay relay pins the model
+   * server-side and rejects requests that try to choose one. Default: false.
+   */
+  omitModelParam?: boolean;
+  /**
+   * Called with parsed JSON frames the adapter does not handle itself
+   * (anything other than `Results`/`UtteranceEnd`, e.g. `Metadata` or a
+   * relay's own control frames). Lets a wrapping adapter react to
+   * relay-specific frames without duplicating the frame pipeline.
+   */
+  onUnhandledFrame?: (frame: Record<string, unknown>) => void;
+  /** Connect timeout in milliseconds. Default: 10_000. */
+  connectTimeoutMs?: number;
+  /** Inactivity timeout in milliseconds. Default: 30_000. */
+  inactivityTimeoutMs?: number;
+  /**
+   * Interval (ms) between Deepgram `KeepAlive` control frames sent during
+   * silent stretches. Default: 5_000. Set to 0 to disable (not recommended
+   * outside tests — the server-side socket will close after ~10s of
+   * silence).
+   */
+  keepaliveIntervalMs?: number;
+  /**
+   * Grace (ms) after a Finalize before `finalized` is emitted without a
+   * `from_finalize` flush from Deepgram. Default: 2_000.
+   */
+  finalizeFallbackMs?: number;
+  /** Audio sample rate in Hz (default: 16000). Passed through from the client WebSocket connection. */
+  sampleRate?: number;
+  /**
+   * Enable Deepgram's built-in speaker diarization. Default: false.
+   *
+   * When `true`, the adapter appends `diarize=true` to the Deepgram live
+   * URL so Deepgram attaches a `speaker` integer to each word (and
+   * sometimes a top-level `speaker` to the alternative). The adapter
+   * aggregates per-segment speakers (mode, with first-word tiebreaker)
+   * into a single `speakerLabel` emitted on `partial` / `final` events,
+   * alongside the alternative's `confidence`. Consumers (e.g. Meet) use
+   * this stable-within-session label to bind opaque ASR speakers to real
+   * participant identities.
+   *
+   * Kept off by default so existing non-Meet callers (telephony, chat
+   * composer) preserve their current lean URL + response shape.
+   */
+  diarize?: boolean;
+  /**
+   * Emit `final` events only at utterance boundaries. Default: false.
+   *
+   * Deepgram commits a long sentence as multiple `is_final` segments
+   * before the speaker pauses. When `true`, committed segment texts are
+   * withheld and accumulated, and a single aggregated `final` is emitted
+   * when Deepgram signals an utterance boundary (`speech_final` on a
+   * Results frame, or an `UtteranceEnd` frame), or when the session
+   * closes with text still pending. Boundary signals with no accumulated
+   * text emit nothing. Aggregated finals omit `speakerLabel` /
+   * `confidence` (segment-level scores do not compose across segments).
+   *
+   * Used by telephony call ingestion so replies trigger once per caller
+   * utterance. When `false`, every `is_final` segment emits its own
+   * `final` event (chat composer / live-voice behavior).
+   */
+  utteranceBoundaryFinals?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Deepgram streaming response types (subset relevant to transcript events)
+// ---------------------------------------------------------------------------
+
+/**
+ * A single word within a Deepgram streaming alternative. When diarization
+ * is enabled, each word carries a numeric `speaker` tag identifying the
+ * detected speaker turn — stable within a session (but opaque — Deepgram
+ * has no real-world identity).
+ */
+interface DeepgramStreamWord {
+  word?: string;
+  speaker?: number;
+  confidence?: number;
+  start?: number;
+  end?: number;
+  /**
+   * BCP-47 tag of the language this word was spoken in. Present only on
+   * code-switching models (nova-3 with `language=multi`).
+   */
+  language?: string;
+}
+
+/**
+ * A single transcript alternative within a Deepgram streaming response.
+ *
+ * When `diarize=true`, Deepgram attaches per-word speaker tags in the
+ * `words` array. Some API versions also surface a top-level `speaker`
+ * tag on the alternative itself when a chunk is dominated by a single
+ * speaker — we check both fields when extracting a label for the chunk.
+ */
+interface DeepgramStreamAlternative {
+  transcript?: string;
+  confidence?: number;
+  /** Present on some API versions when the chunk has a dominant speaker. */
+  speaker?: number;
+  /** Per-word speaker tags when diarization is enabled. */
+  words?: DeepgramStreamWord[];
+  /**
+   * Detected languages for the chunk in dominance order. Emitted by
+   * code-switching models; the container varies by API version, so
+   * {@link DeepgramStreamChannel.languages} is checked as well.
+   */
+  languages?: string[];
+}
+
+/** A channel within a Deepgram streaming response. */
+interface DeepgramStreamChannel {
+  alternatives?: DeepgramStreamAlternative[];
+  /**
+   * Detected languages for the chunk in dominance order. Alternate
+   * container for {@link DeepgramStreamAlternative.languages} on some
+   * API versions.
+   */
+  languages?: string[];
+}
+
+/**
+ * The top-level Deepgram streaming response frame.
+ *
+ * Key fields for event normalization:
+ * - `is_final` — true when the transcript for this audio segment is committed
+ *   and will not be revised. When false, the transcript is interim (partial).
+ * - `speech_final` — true when Deepgram's endpointing detects a natural
+ *   speech pause. Combined with `is_final`, this signals a committed utterance
+ *   boundary. We emit a `final` event only when `is_final` is true.
+ * - `type` — `"Results"` for transcript frames, `"Metadata"` for session info,
+ *   `"UtteranceEnd"` for endpointing signals.
+ */
+interface DeepgramStreamResponse {
+  type?: string;
+  is_final?: boolean;
+  speech_final?: boolean;
+  /**
+   * True when this Results frame is the flush produced by a `Finalize`
+   * control message (see {@link DeepgramRealtimeTranscriber.finalizeUtterance}).
+   * The flushed transcript may be empty when nothing was buffered.
+   */
+  from_finalize?: boolean;
+  channel?: DeepgramStreamChannel;
+  channel_index?: number[];
+  /** Duration of the audio segment in seconds. */
+  duration?: number;
+  /** Start offset of the audio segment in seconds. */
+  start?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Minimal WebSocket interface
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal structural WebSocket interface so we can test without depending
+ * on Bun's global WebSocket type at the type level.
+ */
+interface WsLike {
+  readonly readyState: number;
+  readonly bufferedAmount: number;
+  send(data: string | ArrayBufferLike | ArrayBuffer | Uint8Array): void;
+  close(code?: number, reason?: string): void;
+  addEventListener(type: "open", listener: () => void): void;
+  addEventListener(
+    type: "close",
+    listener: (ev: { code: number; reason: string }) => void,
+  ): void;
+  addEventListener(type: "error", listener: (ev: unknown) => void): void;
+  addEventListener(
+    type: "message",
+    listener: (ev: { data: unknown }) => void,
+  ): void;
+  removeEventListener(type: string, listener: unknown): void;
+}
+
+const WS_OPEN = 1;
+
+// ---------------------------------------------------------------------------
+// Adapter implementation
+// ---------------------------------------------------------------------------
+
+/**
+ * Deepgram realtime streaming transcriber.
+ *
+ * Implements the daemon {@link StreamingTranscriber} contract on top of
+ * Deepgram's live transcription WebSocket API.
+ */
+export class DeepgramRealtimeTranscriber implements StreamingTranscriber {
+  readonly providerId = "deepgram" as const;
+  readonly boundaryId = "daemon-streaming" as const;
+
+  private readonly apiKey: string;
+  private readonly model: string;
+  private readonly language: string | undefined;
+  private readonly smartFormatting: boolean;
+  private readonly interimResults: boolean;
+  private readonly utteranceEndMs: number | undefined;
+  private readonly baseUrl: string;
+  private readonly connectTimeoutMs: number;
+  private readonly inactivityTimeoutMs: number;
+  private readonly keepaliveIntervalMs: number;
+  private readonly finalizeFallbackMs: number;
+  private readonly sampleRate: number;
+  /**
+   * Whether speaker diarization is requested. Forwarded to the Deepgram
+   * WebSocket as `diarize=true` and drives speaker-label extraction from
+   * Results frames — see {@link DeepgramRealtimeOptions.diarize}.
+   */
+  private readonly diarize: boolean;
+
+  /**
+   * Whether `final` events are gated on utterance boundaries — see
+   * {@link DeepgramRealtimeOptions.utteranceBoundaryFinals}.
+   */
+  private readonly utteranceBoundaryFinals: boolean;
+
+  private readonly path: string;
+  private readonly queryAuth: boolean;
+  private readonly omitModelParam: boolean;
+  private readonly onUnhandledFrame:
+    | ((frame: Record<string, unknown>) => void)
+    | undefined;
+
+  /**
+   * Committed (`is_final`) segment texts withheld until the next
+   * utterance boundary. Only populated when
+   * {@link utteranceBoundaryFinals} is enabled.
+   */
+  private pendingFinalSegments: string[] = [];
+
+  /**
+   * Raw detected-language tags for the withheld segments, accumulated
+   * alongside {@link pendingFinalSegments} and ranked into the event's
+   * `languages` when the utterance flushes. Cleared wherever the pending
+   * segments are cleared. Only populated when
+   * {@link utteranceBoundaryFinals} is enabled.
+   */
+  private pendingLanguageTags: string[] = [];
+
+  /** The live WebSocket connection, set during start(). */
+  private ws: WsLike | null = null;
+
+  /** Callback for emitting events to the session orchestrator. */
+  private onEvent: ((event: SttStreamServerEvent) => void) | null = null;
+
+  /** Whether the session has been fully closed. */
+  private closed = false;
+
+  /**
+   * Number of `Finalize` control frames in flight — incremented when
+   * {@link finalizeUtterance} sends a frame, decremented when a
+   * `from_finalize` flush (or the fallback timer) emits its `finalized`
+   * event. Deepgram answers requests in order, so each settlement pairs
+   * with the oldest outstanding request; counting keeps `finalized`
+   * emitted exactly once per request even when requests overlap.
+   */
+  private outstandingFinalizes = 0;
+
+  /**
+   * Number of Finalize requests the fallback timer settled whose
+   * `from_finalize` flush has not yet arrived. Flushes arrive in request
+   * order, so while this is positive the next `from_finalize` frame
+   * answers a fallback-settled request: it is dropped as stale instead of
+   * being emitted as — and settling — a newer request's flush.
+   *
+   * The debt lives only until the next Finalize send —
+   * {@link finalizeUtterance} resets it (rationale at the reset) — and is
+   * also reset on close alongside the outstanding-request drain. The
+   * live-voice session serializes requests (at most one in flight), so in
+   * practice the counter is 0 or 1; no code path relies on larger values.
+   */
+  private fallbackSettledFinalizes = 0;
+
+  /**
+   * Fallback timer for in-flight Finalize requests. Deepgram omits the
+   * `from_finalize` flush when nothing significant is buffered, so this
+   * timer emits `finalized` after {@link FINALIZE_FALLBACK_MS} to keep the
+   * completion contract, re-arming while requests remain outstanding.
+   * Cleared when a flush arrives (and re-armed if more are pending) or on
+   * cleanup.
+   */
+  private finalizeFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Whether stop() has been called. */
+  private stopping = false;
+
+  /** Inactivity timer handle. */
+  private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * When the first audio frame went out after the last inbound provider
+   * message; null while nothing is owed a response. The inactivity
+   * watchdog only rules "hung" while this is set — Deepgram sends nothing
+   * for silence-only stretches (KeepAlives get no reply), so inbound
+   * quiet alone is not evidence of a hang.
+   */
+  private awaitingResponseSinceMs: number | null = null;
+
+  /** Close grace timer handle. */
+  private closeGraceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Periodic keepalive timer. Fires every {@link keepaliveIntervalMs} while
+   * the socket is open and emits a Deepgram `KeepAlive` control frame so
+   * silent stretches do not trip Deepgram's server-side inactivity close.
+   */
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(apiKey: string, options: DeepgramRealtimeOptions = {}) {
+    this.apiKey = apiKey;
+    this.model = options.model ?? DEFAULT_MODEL;
+    this.language = options.language;
+    this.smartFormatting = options.smartFormatting ?? true;
+    this.interimResults = options.interimResults ?? true;
+    this.utteranceEndMs = options.utteranceEndMs;
+    this.baseUrl = (options.baseUrl ?? DEFAULT_WS_BASE_URL).replace(/\/+$/, "");
+    this.connectTimeoutMs =
+      options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+    this.inactivityTimeoutMs =
+      options.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
+    this.keepaliveIntervalMs =
+      options.keepaliveIntervalMs ?? DEFAULT_KEEPALIVE_INTERVAL_MS;
+    this.finalizeFallbackMs =
+      options.finalizeFallbackMs ?? FINALIZE_FALLBACK_MS;
+    this.sampleRate = options.sampleRate ?? 16_000;
+    this.diarize = options.diarize ?? false;
+    this.utteranceBoundaryFinals = options.utteranceBoundaryFinals ?? false;
+    this.path = options.path ?? "/v1/listen";
+    this.queryAuth = options.queryAuth ?? false;
+    this.omitModelParam = options.omitModelParam ?? false;
+    this.onUnhandledFrame = options.onUnhandledFrame;
+  }
+
+  // ── StreamingTranscriber interface ──────────────────────────────────
+
+  async start(onEvent: (event: SttStreamServerEvent) => void): Promise<void> {
+    if (this.ws) {
+      throw new Error("DeepgramRealtimeTranscriber: start() called twice");
+    }
+    this.onEvent = onEvent;
+
+    const url = this.buildWebSocketUrl();
+    // Query auth carries the API key in the URL — never log it.
+    log.info({ url: this.redact(url) }, "Opening Deepgram realtime session");
+
+    const ws = this.createWebSocket(url);
+    this.ws = ws;
+
+    // Wait for the WebSocket to open or fail.
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+
+      const connectTimer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        this.forceClose();
+        reject(new Error("Deepgram realtime connect timeout"));
+      }, this.connectTimeoutMs);
+
+      const onOpen = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(connectTimer);
+        resolve();
+      };
+
+      const onError = (ev: unknown) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(connectTimer);
+        const msg =
+          ev instanceof Error
+            ? ev.message
+            : typeof ev === "object" && ev !== null && "message" in ev
+              ? String((ev as { message: unknown }).message)
+              : "WebSocket error during connect";
+        reject(
+          new Error(`Deepgram realtime connect error: ${this.redact(msg)}`),
+        );
+      };
+
+      const onClose = (ev: { code: number; reason: string }) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(connectTimer);
+        reject(
+          new Error(
+            `Deepgram WebSocket closed before open (code=${ev.code}, reason=${this.redact(ev.reason)})`,
+          ),
+        );
+      };
+
+      ws.addEventListener("open", onOpen);
+      ws.addEventListener("error", onError);
+      ws.addEventListener("close", onClose);
+    });
+
+    // Socket is now open — attach the message/close/error handlers for
+    // the active session lifetime.
+    this.attachSessionHandlers(ws);
+    this.resetInactivityTimer();
+    this.startKeepaliveTimer();
+
+    log.info("Deepgram realtime session opened");
+  }
+
+  sendAudio(audio: Buffer, _mimeType: string): void {
+    if (this.closed || this.stopping) {
+      return;
+    }
+
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WS_OPEN) {
+      return;
+    }
+
+    // Backpressure check — drop frames if the outbound buffer is too full
+    // to prevent unbounded memory growth.
+    if (ws.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+      log.warn(
+        { bufferedAmount: ws.bufferedAmount },
+        "Deepgram realtime backpressure: dropping audio frame",
+      );
+      return;
+    }
+
+    // Deepgram's live endpoint accepts raw audio bytes on the WebSocket.
+    ws.send(new Uint8Array(audio));
+    this.awaitingResponseSinceMs ??= Date.now();
+  }
+
+  /**
+   * Flush all provider-buffered audio into final transcript(s) without
+   * closing the stream.
+   *
+   * Sends the Deepgram `Finalize` control message; Deepgram responds by
+   * flushing buffered audio as a Results frame with `from_finalize: true`
+   * (possibly with an empty transcript). The adapter emits the resulting
+   * `final` (when non-empty) followed by one `finalized` event, and the
+   * stream stays open for more audio.
+   *
+   * Every request settles exactly once, oldest first: by its
+   * `from_finalize` flush when one arrives in time, or by a fallback
+   * timer ({@link DeepgramRealtimeOptions.finalizeFallbackMs}) when
+   * Deepgram omits the flush (nothing significant buffered) or answers
+   * too slowly. A flush arriving after its request was fallback-settled
+   * but before the next Finalize is sent is dropped as stale — no
+   * `final`, no second `finalized` — so its text is not attributed to a
+   * newer request. Sending the next Finalize clears that stale-flush debt
+   * (see {@link fallbackSettledFinalizes}). When the socket is not open
+   * there is nothing buffered provider-side, so `finalized` is emitted
+   * immediately. {@link stop} remains the session-teardown path.
+   */
+  finalizeUtterance(): void {
+    const ws = this.ws;
+    if (this.closed || this.stopping || !ws || ws.readyState !== WS_OPEN) {
+      // Nothing buffered provider-side — the flush is trivially complete.
+      this.emitEvent({ type: "finalized" });
+      return;
+    }
+
+    try {
+      ws.send(JSON.stringify({ type: "Finalize" }));
+    } catch (err) {
+      log.warn({ err }, "Deepgram Finalize send failed");
+      this.emitEvent({ type: "finalized" });
+      return;
+    }
+    // Stream ordering means a slow flush for an earlier fallback-settled
+    // request reaches us before Deepgram processes the Finalize just
+    // sent, so any debt still unconsumed here is for a flush Deepgram
+    // omitted (the common fallback cause) and would otherwise sit forever,
+    // wrongly dropping this request's legitimate flush. A >fallback-window
+    // provider flush racing an immediate re-release could in theory land
+    // after this send and be misattributed to this request; the session's
+    // queue-head drop-guard bounds that case.
+    this.fallbackSettledFinalizes = 0;
+    this.outstandingFinalizes += 1;
+    this.armFinalizeFallbackTimer();
+  }
+
+  stop(): void {
+    if (this.closed || this.stopping) {
+      return;
+    }
+    this.stopping = true;
+
+    log.info("Stopping Deepgram realtime session");
+
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WS_OPEN) {
+      this.emitClosedAndCleanup();
+      return;
+    }
+
+    // Send the Deepgram CloseStream message to signal end-of-audio.
+    // The provider may flush remaining finals before closing.
+    try {
+      ws.send(JSON.stringify({ type: "CloseStream" }));
+    } catch {
+      // If the send fails, force-close immediately.
+      this.emitClosedAndCleanup();
+      return;
+    }
+
+    // Start a grace timer — if the provider doesn't close within the
+    // grace window, we force-close to prevent session leaks.
+    this.closeGraceTimer = setTimeout(() => {
+      log.warn("Deepgram realtime close grace timeout — forcing close");
+      this.emitClosedAndCleanup();
+    }, CLOSE_GRACE_MS);
+  }
+
+  // ── WebSocket lifecycle ─────────────────────────────────────────────
+
+  /**
+   * Create a WebSocket instance. Factored out for test mockability.
+   *
+   * Passes the Deepgram API key via the `Authorization: Token <key>` header.
+   * Bun's WebSocket constructor supports a second `options` argument with
+   * custom headers, unlike the browser WebSocket API.
+   */
+  private createWebSocket(url: string): WsLike {
+    const WebSocketCtor = (
+      globalThis as unknown as {
+        WebSocket: new (
+          url: string,
+          options?: { headers?: Record<string, string> },
+        ) => WsLike;
+      }
+    ).WebSocket;
+    if (typeof WebSocketCtor !== "function") {
+      throw new Error("global WebSocket is not available in this runtime");
+    }
+    // Query auth carries the key in the URL instead (see buildWebSocketUrl).
+    if (this.queryAuth) {
+      return new WebSocketCtor(url);
+    }
+    return new WebSocketCtor(url, {
+      headers: {
+        Authorization: `Token ${this.apiKey}`,
+      },
+    });
+  }
+
+  /**
+   * Attach session-lifetime handlers (message, close, error) to the
+   * opened WebSocket. These handlers drive the event normalization
+   * pipeline.
+   */
+  private attachSessionHandlers(ws: WsLike): void {
+    ws.addEventListener("message", (ev: { data: unknown }) => {
+      this.handleProviderMessage(ev.data);
+    });
+
+    ws.addEventListener("close", (ev: { code: number; reason: string }) => {
+      this.handleProviderClose(ev.code, ev.reason);
+    });
+
+    ws.addEventListener("error", (ev: unknown) => {
+      this.handleProviderError(ev);
+    });
+  }
+
+  // ── Provider message handling ───────────────────────────────────────
+
+  /**
+   * Parse and normalize a Deepgram streaming response into daemon events.
+   */
+  private handleProviderMessage(data: unknown): void {
+    if (this.closed) {
+      return;
+    }
+
+    this.resetInactivityTimer();
+
+    let raw: string;
+    if (typeof data === "string") {
+      raw = data;
+    } else if (data instanceof ArrayBuffer) {
+      raw = new TextDecoder().decode(data);
+    } else {
+      // Unexpected binary format — ignore.
+      return;
+    }
+
+    let frame: DeepgramStreamResponse;
+    try {
+      frame = JSON.parse(raw) as DeepgramStreamResponse;
+    } catch {
+      log.debug("Dropped non-JSON Deepgram frame");
+      return;
+    }
+
+    if (!frame || typeof frame !== "object") {
+      return;
+    }
+
+    // Deepgram uses `type: "Results"` for transcript frames.
+    if (frame.type === "Results") {
+      this.handleTranscriptFrame(frame);
+      return;
+    }
+
+    // `UtteranceEnd` is an endpointing signal — no transcript text, but
+    // it confirms the previous is_final segment is a natural boundary.
+    // In utterance-boundary mode it flushes any withheld segments; in
+    // pass-through mode finals were already emitted on is_final=true.
+    if (frame.type === "UtteranceEnd") {
+      log.debug("Received UtteranceEnd signal");
+      this.flushPendingUtterance();
+      return;
+    }
+
+    // Metadata and other frame types are informational for this adapter;
+    // surface them to a wrapping adapter that may care (e.g. relay control
+    // frames).
+    this.onUnhandledFrame?.(frame as Record<string, unknown>);
+  }
+
+  /**
+   * Normalize a Deepgram `Results` frame into partial or final events.
+   *
+   * Deepgram semantics:
+   * - `is_final: false` — interim transcript, may be revised.
+   * - `is_final: true` — committed transcript for this segment.
+   * - `speech_final: true` — endpointing detected a pause; combined with
+   *   `is_final: true`, this marks a natural utterance boundary.
+   *
+   * When {@link DeepgramRealtimeOptions.diarize} is enabled, the frame
+   * also carries per-word speaker tags under
+   * `channel.alternatives[0].words[].speaker`. We derive a single
+   * per-chunk `speakerLabel` by picking the dominant speaker across the
+   * words — see {@link extractSpeakerLabel}. Confidence is taken from
+   * the top alternative when present.
+   *
+   * Code-switching models (nova-3 with `language=multi`) tag detected
+   * languages per word and per container. When present, these become the
+   * dominance-ranked `languages` field on the emitted events (see
+   * {@link extractLanguages}). The field is omitted when the frame
+   * carries no language metadata.
+   *
+   * We emit:
+   * - `partial` for `is_final: false` frames (if interim results enabled).
+   * - `final` for `is_final: true` frames.
+   * - `finalized` after the `final` of a `from_finalize: true` flush frame
+   *   (the response to {@link finalizeUtterance}). An empty flush emits
+   *   only `finalized` — silence flushes carry no transcript to commit. A
+   *   flush arriving while a fallback-settled request still awaits its
+   *   flush is dropped entirely (no `final`, no `finalized`) — see
+   *   {@link finalizeUtterance}.
+   */
+  private handleTranscriptFrame(frame: DeepgramStreamResponse): void {
+    const alternative = frame.channel?.alternatives?.[0];
+    const transcript = alternative?.transcript;
+    const fromFinalize = frame.from_finalize === true;
+
+    // Extract text, defaulting to empty string for silence segments.
+    const text = typeof transcript === "string" ? transcript.trim() : "";
+
+    // A flush arriving while fallback-settled requests await theirs is
+    // stale: flushes arrive in request order, so it pairs with the oldest
+    // fallback-settled request, whose `finalized` was already emitted.
+    // Emitting its text (or another `finalized`) here would attribute it
+    // to a newer request's utterance. The debt window closes when the
+    // next Finalize is sent — see finalizeUtterance.
+    if (fromFinalize && this.fallbackSettledFinalizes > 0) {
+      this.fallbackSettledFinalizes -= 1;
+      log.debug(
+        { droppedTextLength: text.length },
+        "Dropped a stale from_finalize flush: its request was fallback-settled",
+      );
+      return;
+    }
+
+    const speakerLabel = this.diarize
+      ? extractSpeakerLabel(alternative)
+      : undefined;
+    const confidence =
+      typeof alternative?.confidence === "number"
+        ? alternative.confidence
+        : undefined;
+    const languages = extractLanguages(frame.channel, alternative);
+
+    if (frame.is_final) {
+      if (this.utteranceBoundaryFinals) {
+        // Withhold committed segments until an utterance boundary. A
+        // Finalize flush is a forced boundary — flush what is pending.
+        if (text.length > 0) {
+          this.pendingFinalSegments.push(text);
+          // Collect language tags only from frames that contributed text
+          // so the flushed metadata stays aligned with the emitted
+          // transcript (empty frames may still carry tags, but they
+          // describe no emitted words). Raw per-word tags are preferred
+          // over the frame's ranked list so cross-frame frequency
+          // weighting survives until the flush ranks the whole utterance.
+          const wordTags = collectWordLanguageTags(alternative);
+          this.pendingLanguageTags.push(
+            ...(wordTags.length > 0 ? wordTags : languages),
+          );
+        }
+        if (frame.speech_final || fromFinalize) {
+          this.flushPendingUtterance();
+        }
+      } else if (text.length > 0 || !fromFinalize) {
+        // Committed transcript — emit as final. Empty Finalize flushes
+        // are suppressed (nothing was buffered provider-side).
+        this.emitEvent({
+          type: "final",
+          text,
+          ...(speakerLabel !== undefined ? { speakerLabel } : {}),
+          ...(confidence !== undefined ? { confidence } : {}),
+          ...(languages.length > 0 ? { languages } : {}),
+          // Mark the finalize flush so consumers can attribute it to the
+          // utterance that requested the flush rather than new speech.
+          ...(fromFinalize ? { fromFinalize: true } : {}),
+        });
+      }
+    } else if (this.interimResults) {
+      // Interim transcript — emit as partial.
+      this.emitEvent({
+        type: "partial",
+        text,
+        ...(speakerLabel !== undefined ? { speakerLabel } : {}),
+        ...(confidence !== undefined ? { confidence } : {}),
+        ...(languages.length > 0 ? { languages } : {}),
+      });
+    }
+
+    if (fromFinalize) {
+      this.settleOneFinalize();
+    }
+  }
+
+  /**
+   * Handle provider-side WebSocket close.
+   */
+  private handleProviderClose(code: number, reason: string): void {
+    if (this.closed) {
+      return;
+    }
+
+    // Close reasons can echo the dialed URL (query auth carries the key
+    // there) — redact before logging, not just before emitting.
+    const safeReason = this.redact(reason);
+
+    // Normal close (1000) or going-away (1001) after stop() is expected.
+    if (this.stopping && (code === 1000 || code === 1001)) {
+      log.info(
+        { code, reason: safeReason },
+        "Deepgram realtime session closed normally",
+      );
+      this.emitClosedAndCleanup();
+      return;
+    }
+
+    // Unexpected close — map to an error event.
+    log.warn(
+      { code, reason: safeReason },
+      "Deepgram realtime session closed unexpectedly",
+    );
+
+    const category =
+      code === 1008 || code === 4001
+        ? ("auth" as const)
+        : code === 1013
+          ? ("rate-limit" as const)
+          : ("provider-error" as const);
+
+    this.emitEvent({
+      type: "error",
+      category,
+      message: `Deepgram WebSocket closed (code=${code}, reason=${safeReason})`,
+    });
+    this.emitClosedAndCleanup();
+  }
+
+  /**
+   * Handle provider-side WebSocket error.
+   */
+  private handleProviderError(ev: unknown): void {
+    if (this.closed) {
+      return;
+    }
+
+    const message = this.redact(
+      ev instanceof Error
+        ? ev.message
+        : typeof ev === "object" && ev !== null && "message" in ev
+          ? String((ev as { message: unknown }).message)
+          : "WebSocket error",
+    );
+
+    // The raw event can embed the dialed URL (query auth carries the key
+    // there), so log the redacted message rather than the event object.
+    log.error({ error: message }, "Deepgram realtime WebSocket error");
+
+    this.emitEvent({
+      type: "error",
+      category: "provider-error",
+      message: `Deepgram WebSocket error: ${message}`,
+    });
+    this.emitClosedAndCleanup();
+  }
+
+  // ── Event emission & cleanup ────────────────────────────────────────
+
+  /**
+   * Emit a server event to the session orchestrator. Swallows listener
+   * errors to prevent tearing down the adapter.
+   */
+  private emitEvent(event: SttStreamServerEvent): void {
+    if (!this.onEvent) {
+      return;
+    }
+    try {
+      this.onEvent(event);
+    } catch (err) {
+      log.warn({ error: err }, "Listener error in Deepgram realtime adapter");
+    }
+  }
+
+  /**
+   * Emit a single aggregated `final` for the withheld `is_final` segments
+   * of the current utterance, carrying the dominance-ranked detected
+   * languages accumulated alongside them (field omitted when no segment
+   * carried language metadata). No-op when nothing is pending, so
+   * boundary signals over silence emit nothing.
+   */
+  private flushPendingUtterance(): void {
+    if (this.pendingFinalSegments.length === 0) {
+      // Tags accumulate only alongside text, but clear defensively so a
+      // future drift cannot leak one utterance's tags into the next.
+      this.pendingLanguageTags = [];
+      return;
+    }
+    const text = this.pendingFinalSegments.join(" ");
+    const languages = rankLanguages(this.pendingLanguageTags);
+    this.pendingFinalSegments = [];
+    this.pendingLanguageTags = [];
+    this.emitEvent({
+      type: "final",
+      text,
+      ...(languages.length > 0 ? { languages } : {}),
+    });
+  }
+
+  /**
+   * Emit `finalized` for the oldest in-flight {@link finalizeUtterance}
+   * request and re-arm the fallback timer while more remain outstanding.
+   * No-op when no request is in flight, so `finalized` is emitted at most
+   * once per request.
+   */
+  private settleOneFinalize(): void {
+    this.clearFinalizeFallbackTimer();
+    if (this.outstandingFinalizes === 0) {
+      return;
+    }
+    this.outstandingFinalizes -= 1;
+    this.emitEvent({ type: "finalized" });
+    if (this.outstandingFinalizes > 0) {
+      this.armFinalizeFallbackTimer();
+    }
+  }
+
+  /**
+   * (Re)arm the fallback timer that emits `finalized` when Deepgram
+   * omits the `from_finalize` flush for an in-flight Finalize request.
+   */
+  private armFinalizeFallbackTimer(): void {
+    if (this.closed) {
+      return;
+    }
+    this.clearFinalizeFallbackTimer();
+    this.finalizeFallbackTimer = setTimeout(() => {
+      this.finalizeFallbackTimer = null;
+      log.debug(
+        "Deepgram sent no from_finalize flush — emitting finalized fallback",
+      );
+      if (this.outstandingFinalizes > 0) {
+        // The request settles without its flush; a flush that still
+        // arrives before the next Finalize send is dropped as stale in
+        // handleTranscriptFrame.
+        this.fallbackSettledFinalizes += 1;
+      }
+      // The settled request covers all audio sent so far — Deepgram had
+      // nothing significant buffered, so no response is owed anymore.
+      // Leaving the debt set would let the inactivity watchdog kill the
+      // now-idle stream ~30s after a short/noisy utterance that elicited
+      // no provider frames at all.
+      this.awaitingResponseSinceMs = null;
+      this.settleOneFinalize();
+    }, this.finalizeFallbackMs);
+  }
+
+  private clearFinalizeFallbackTimer(): void {
+    if (this.finalizeFallbackTimer !== null) {
+      clearTimeout(this.finalizeFallbackTimer);
+      this.finalizeFallbackTimer = null;
+    }
+  }
+
+  /**
+   * Emit a `closed` event and clean up all resources (timers, WebSocket).
+   * Flushes any withheld utterance text first so boundary-gated sessions
+   * never lose committed transcript on close. Idempotent — safe to call
+   * multiple times.
+   */
+  private emitClosedAndCleanup(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+
+    this.clearTimers();
+    this.forceClose();
+
+    this.flushPendingUtterance();
+    // Every Finalize with no flush response must still complete before
+    // the stream reports closed, so waiters see one finalized per request
+    // followed by closed, in order.
+    while (this.outstandingFinalizes > 0) {
+      this.settleOneFinalize();
+    }
+    // Closed sessions process no further frames, so pending stale-flush
+    // bookkeeping resets with the drained requests.
+    this.fallbackSettledFinalizes = 0;
+    this.emitEvent({ type: "closed" });
+    this.onEvent = null;
+  }
+
+  /**
+   * Force-close the WebSocket without emitting events. Used during
+   * cleanup and timeout paths.
+   */
+  private forceClose(): void {
+    const ws = this.ws;
+    this.ws = null;
+    if (!ws) {
+      return;
+    }
+
+    try {
+      ws.close();
+    } catch {
+      // Best effort — already closed sockets may throw.
+    }
+  }
+
+  /**
+   * Clear all active timers.
+   */
+  private clearTimers(): void {
+    if (this.inactivityTimer !== null) {
+      clearTimeout(this.inactivityTimer);
+      this.inactivityTimer = null;
+    }
+    if (this.closeGraceTimer !== null) {
+      clearTimeout(this.closeGraceTimer);
+      this.closeGraceTimer = null;
+    }
+    if (this.keepaliveTimer !== null) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
+    this.clearFinalizeFallbackTimer();
+  }
+
+  /**
+   * Start the periodic keepalive timer. Sends a Deepgram `KeepAlive`
+   * control frame every {@link keepaliveIntervalMs}; this is the only
+   * thing that resets Deepgram's server-side inactivity timer when the
+   * stream is carrying silence (raw silence PCM frames do not count).
+   *
+   * Skipped when {@link keepaliveIntervalMs} is 0 (test override) or the
+   * adapter is already closed/stopping.
+   */
+  private startKeepaliveTimer(): void {
+    if (this.closed || this.stopping) {
+      return;
+    }
+    if (this.keepaliveIntervalMs <= 0) {
+      return;
+    }
+    this.keepaliveTimer = setInterval(() => {
+      if (this.closed || this.stopping) {
+        return;
+      }
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WS_OPEN) {
+        return;
+      }
+      try {
+        ws.send(JSON.stringify({ type: "KeepAlive" }));
+      } catch (err) {
+        log.warn({ err }, "Deepgram KeepAlive send failed");
+      }
+    }, this.keepaliveIntervalMs);
+  }
+
+  /**
+   * Reset the inactivity timer. Called on inbound provider messages to
+   * detect provider-side hangs. Not reset on outbound audio sends —
+   * continuous audio from the caller must not mask a silent provider.
+   */
+  private resetInactivityTimer(): void {
+    this.awaitingResponseSinceMs = null;
+    this.armInactivityTimer(this.inactivityTimeoutMs);
+  }
+
+  /**
+   * (Re)arm the inactivity watchdog. On fire it only rules "hung" when
+   * audio has been awaiting a response for a full timeout window;
+   * otherwise the stream is just idle (or the audio is too fresh) and the
+   * timer re-arms for the remainder.
+   */
+  private armInactivityTimer(delayMs: number): void {
+    if (this.closed || this.stopping) {
+      return;
+    }
+
+    if (this.inactivityTimer !== null) {
+      clearTimeout(this.inactivityTimer);
+    }
+
+    this.inactivityTimer = setTimeout(() => {
+      if (this.closed) {
+        return;
+      }
+
+      const since = this.awaitingResponseSinceMs;
+      if (since === null) {
+        this.armInactivityTimer(this.inactivityTimeoutMs);
+        return;
+      }
+      const waitedMs = Date.now() - since;
+      if (waitedMs < this.inactivityTimeoutMs) {
+        this.armInactivityTimer(this.inactivityTimeoutMs - waitedMs);
+        return;
+      }
+
+      log.warn("Deepgram realtime inactivity timeout");
+      this.emitEvent({
+        type: "error",
+        category: "timeout",
+        message: "Deepgram realtime session timed out due to inactivity",
+      });
+      this.emitClosedAndCleanup();
+    }, delayMs);
+  }
+
+  /**
+   * Strip the API key from text destined for logs, error messages, or
+   * emitted events. Under query auth the key rides in the dialed URL, and
+   * runtimes embed that URL in connection-failure messages and close
+   * reasons; both the raw and URL-encoded forms are removed.
+   */
+  private redact(text: string): string {
+    if (!this.queryAuth || !text) {
+      return text;
+    }
+    return text
+      .split(this.apiKey)
+      .join("***")
+      .split(encodeURIComponent(this.apiKey))
+      .join("***")
+      .replace(/([?&]key=)[^&\s"']*/g, "$1***");
+  }
+
+  // ── URL construction ────────────────────────────────────────────────
+
+  /**
+   * Build the Deepgram live transcription WebSocket URL with query params.
+   *
+   * Audio format and feature flags are passed as query parameters.
+   * Authentication is handled separately via the `Authorization` header
+   * in {@link createWebSocket}.
+   */
+  private buildWebSocketUrl(): string {
+    const params = new URLSearchParams();
+    if (!this.omitModelParam) {
+      params.set("model", this.model);
+    }
+    if (this.queryAuth) {
+      params.set("key", this.apiKey);
+    }
+
+    if (this.language) {
+      params.set("language", this.language);
+    }
+    if (this.smartFormatting) {
+      params.set("smart_format", "true");
+    }
+    if (this.interimResults) {
+      params.set("interim_results", "true");
+    }
+    if (this.utteranceEndMs !== undefined) {
+      params.set("utterance_end_ms", String(this.utteranceEndMs));
+    }
+    if (this.diarize) {
+      params.set("diarize", "true");
+    }
+
+    // Enable punctuation for cleaner transcript output.
+    params.set("punctuate", "true");
+
+    // Request linear16 PCM encoding — clients send raw PCM.
+    params.set("encoding", "linear16");
+    params.set("sample_rate", String(this.sampleRate));
+    params.set("channels", "1");
+
+    return `${this.baseUrl}${this.path}?${params.toString()}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive a single `speakerLabel` for a diarized chunk.
+ *
+ * Deepgram exposes speaker tags in two shapes:
+ *   1. Some API versions attach a top-level `speaker` on the alternative
+ *      when the chunk is dominated by a single voice.
+ *   2. In the general case, per-word speaker tags live on
+ *      `alternatives[0].words[].speaker`.
+ *
+ * We prefer the top-level tag when present; otherwise we pick the
+ * most-frequent per-word speaker. On ties we fall back to the first
+ * word's speaker so short segments where the endpointer didn't cleanly
+ * break between turns still attribute deterministically.
+ *
+ * Returns `undefined` when no speaker information is available — the
+ * resolver treats unlabeled chunks the same as a non-diarizing provider.
+ *
+ * The returned label is `String(speaker)` to match the `speakerLabel`
+ * contract on {@link SttStreamServerPartialEvent} /
+ * {@link SttStreamServerFinalEvent}.
+ */
+/**
+ * Derive the detected languages for a chunk, most dominant first.
+ *
+ * Code-switching models tag languages in two shapes:
+ *   1. Per-word `language` tags on `alternatives[0].words[]`, the richest
+ *      signal; ranked by frequency via {@link rankLanguages} (ties broken
+ *      by first appearance).
+ *   2. A container-level `languages` array in dominance order, attached to
+ *      the alternative or (on some API versions) the channel. Used as the
+ *      fallback when no word carries a tag; normalized and deduped with
+ *      the provider's order preserved.
+ *
+ * Returns `[]` when the frame carries no language metadata: callers omit
+ * the event fields entirely so absence stays distinguishable from a
+ * detected language.
+ */
+function extractLanguages(
+  channel: DeepgramStreamChannel | undefined,
+  alternative: DeepgramStreamAlternative | undefined,
+): string[] {
+  const wordTags = collectWordLanguageTags(alternative);
+  if (wordTags.length > 0) {
+    return rankLanguages(wordTags);
+  }
+
+  const container = Array.isArray(alternative?.languages)
+    ? alternative.languages
+    : Array.isArray(channel?.languages)
+      ? channel.languages
+      : [];
+  const deduped = new Set(
+    container
+      .filter((tag): tag is string => typeof tag === "string")
+      .flatMap((tag) => {
+        const base = baseLanguageSubtag(tag);
+        return base !== undefined ? [base] : [];
+      }),
+  );
+  return [...deduped];
+}
+
+/**
+ * Collect the raw per-word `language` tags of a chunk, in word order and
+ * without ranking or normalization. Used both for per-frame ranking in
+ * {@link extractLanguages} and for cross-frame accumulation in
+ * utterance-boundary mode, where ranking is deferred to the flush so
+ * frequency weighting spans the whole utterance.
+ */
+function collectWordLanguageTags(
+  alternative: DeepgramStreamAlternative | undefined,
+): string[] {
+  return (alternative?.words ?? []).flatMap((word) =>
+    typeof word.language === "string" ? [word.language] : [],
+  );
+}
+
+function extractSpeakerLabel(
+  alternative: DeepgramStreamAlternative | undefined,
+): string | undefined {
+  if (!alternative) {
+    return undefined;
+  }
+  if (typeof alternative.speaker === "number") {
+    return String(alternative.speaker);
+  }
+  const words = alternative.words;
+  if (!Array.isArray(words) || words.length === 0) {
+    return undefined;
+  }
+  const counts = new Map<number, number>();
+  let firstSpeaker: number | undefined;
+  for (const word of words) {
+    if (typeof word.speaker !== "number") {
+      continue;
+    }
+    if (firstSpeaker === undefined) {
+      firstSpeaker = word.speaker;
+    }
+    counts.set(word.speaker, (counts.get(word.speaker) ?? 0) + 1);
+  }
+  if (counts.size === 0 || firstSpeaker === undefined) {
+    return undefined;
+  }
+  // Pick the most common speaker; on ties, prefer the first-word speaker.
+  let bestSpeaker = firstSpeaker;
+  let bestCount = counts.get(firstSpeaker) ?? 0;
+  for (const [speaker, count] of counts) {
+    if (count > bestCount) {
+      bestSpeaker = speaker;
+      bestCount = count;
+    }
+  }
+  return String(bestSpeaker);
+}

@@ -1,0 +1,142 @@
+import { z } from "zod";
+
+/**
+ * Risk level an MCP server's tools start at when its config entry does not
+ * name one. Callers that write or display a server entry must reference this
+ * rather than repeating a literal, so the level stays code-owned: an entry
+ * that omits the field picks up whatever this constant says on every load.
+ */
+export const DEFAULT_MCP_RISK_LEVEL = "medium";
+
+const McpStdioTransportSchema = z
+  .object({
+    type: z.literal("stdio"),
+    command: z
+      .string({ error: "mcp transport command must be a string" })
+      .describe("Command to spawn the MCP server process"),
+    args: z
+      .array(z.string())
+      .default([])
+      .describe("Arguments passed to the MCP server command"),
+    env: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe("Environment variables set for the MCP server process"),
+  })
+  .describe(
+    "Stdio transport — communicates with the MCP server via stdin/stdout",
+  );
+
+const McpSseTransportSchema = z
+  .object({
+    type: z.literal("sse"),
+    url: z
+      .string({ error: "mcp transport url must be a string" })
+      .describe("URL of the MCP SSE endpoint"),
+    headers: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe("Custom HTTP headers sent with SSE requests"),
+  })
+  .describe(
+    "SSE transport — connects to an MCP server over Server-Sent Events",
+  );
+
+const McpStreamableHttpTransportSchema = z
+  .object({
+    type: z.literal("streamable-http"),
+    url: z
+      .string({ error: "mcp transport url must be a string" })
+      .describe("URL of the MCP streamable HTTP endpoint"),
+    headers: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe("Custom HTTP headers sent with requests"),
+  })
+  .describe(
+    "Streamable HTTP transport — connects to an MCP server over HTTP with streaming",
+  );
+
+export const McpTransportSchema = z.discriminatedUnion("type", [
+  McpStdioTransportSchema,
+  McpSseTransportSchema,
+  McpStreamableHttpTransportSchema,
+]);
+
+export const McpServerConfigSchema = z
+  .object({
+    transport: McpTransportSchema,
+    enabled: z
+      .boolean({ error: "mcp server enabled must be a boolean" })
+      .default(true)
+      .describe("Whether this MCP server is enabled"),
+    defaultRiskLevel: z
+      .enum(["low", "medium", "high"], {
+        error: "mcp server defaultRiskLevel must be one of: low, medium, high",
+      })
+      .default(DEFAULT_MCP_RISK_LEVEL)
+      .describe(
+        "Risk level tools from this server start at (affects approval requirements). A tool's own MCP annotations move it one step from here: destructiveHint up, readOnlyHint down.",
+      ),
+    maxTools: z
+      .number({ error: "mcp server maxTools must be a number" })
+      .int()
+      .positive()
+      .default(20)
+      .describe("Maximum number of tools to register from this server"),
+    allowedTools: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Allowlist of tool names — only these tools will be registered (if set)",
+      ),
+    blockedTools: z
+      .array(z.string())
+      .optional()
+      .describe("Blocklist of tool names — these tools will not be registered"),
+  })
+  .describe("Configuration for an individual MCP server");
+
+export const McpConfigSchema = z
+  .object({
+    servers: z
+      .record(z.string(), McpServerConfigSchema)
+      .default({} as Record<string, never>)
+      .describe("Map of MCP server names to their configurations"),
+    globalMaxTools: z
+      .number({ error: "mcp globalMaxTools must be a number" })
+      .int()
+      .positive()
+      .default(50)
+      .describe("Maximum total number of tools across all MCP servers"),
+  })
+  .describe(
+    "Model Context Protocol (MCP) configuration — connect external tool servers",
+  );
+
+export type McpTransport = z.infer<typeof McpTransportSchema>;
+export type McpServerConfig = z.infer<typeof McpServerConfigSchema>;
+export type McpConfig = z.infer<typeof McpConfigSchema>;
+
+/**
+ * Who declared a server: the workspace `config.json`, which the user owns,
+ * or a plugin's `mcp.json`, which its author owns.
+ *
+ * Deliberately not a schema field. It is resolved from where the entry was
+ * read, never parsed from a file, so nothing on disk can claim to be
+ * workspace-owned. What it gates is credential access: only a workspace
+ * server resolves `mcp:<serverId>:*` from the credential store, because a
+ * plugin controls both its server key and its URL and would otherwise
+ * receive a workspace credential at an endpoint it chose.
+ */
+export type McpServerSource = "workspace" | "plugin";
+
+/** A server config with its origin resolved. */
+export interface ResolvedMcpServerConfig extends McpServerConfig {
+  readonly source: McpServerSource;
+}
+
+/** The MCP config the daemon runs: both origins, every server attributed. */
+export interface ResolvedMcpConfig extends Omit<McpConfig, "servers"> {
+  readonly servers: Record<string, ResolvedMcpServerConfig>;
+}

@@ -1,0 +1,402 @@
+/**
+ * Route handler for the unified global search endpoint.
+ *
+ * GET /v1/search/global?q=<query>&limit=20&categories=conversations,memories,schedules,contacts[&deep=true]
+ *
+ * Federates search across conversations, memories, schedules, and contacts.
+ * When `deep=true`, additionally runs Qdrant semantic search on memories
+ * and merges results with lexical matches.
+ */
+
+import { z } from "zod";
+
+import { getConfig } from "../../config/loader.js";
+import { searchContacts } from "../../contacts/contact-store.js";
+import { searchConversations } from "../../persistence/conversation-queries.js";
+import { getMemorySqlite } from "../../persistence/db-connection.js";
+import {
+  embedWithBackend,
+  getMemoryBackendStatus,
+} from "../../persistence/embeddings/embedding-backend.js";
+import { tokenize } from "../../persistence/embeddings/sparse-tokenize.js";
+import { rawMemoryAll } from "../../persistence/raw-query.js";
+import { semanticSearch } from "../../plugins/defaults/memory/v1/semantic-search.js";
+import { listSchedules } from "../../schedule/schedule-store.js";
+import { getLogger } from "../../util/logger.js";
+import { ACTOR_PRINCIPALS } from "../auth/route-policy.js";
+import { BadRequestError } from "./errors.js";
+import type { RouteDefinition, RouteHandlerArgs } from "./types.js";
+
+const log = getLogger("global-search");
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+const globalSearchConversationSchema = z.object({
+  id: z.string(),
+  title: z.string().nullable(),
+  updatedAt: z.number(),
+  excerpt: z.string(),
+  matchCount: z.number().int(),
+});
+
+const globalSearchMemorySchema = z.object({
+  id: z.string(),
+  kind: z.string(),
+  text: z.string(),
+  subject: z.string().nullable(),
+  confidence: z.number(),
+  updatedAt: z.number(),
+  source: z.enum(["lexical", "semantic"]),
+});
+
+const globalSearchScheduleSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  expression: z.string().nullable(),
+  message: z.string(),
+  enabled: z.boolean(),
+  nextRunAt: z.number().nullable(),
+});
+
+const globalSearchContactSchema = z.object({
+  id: z.string(),
+  displayName: z.string(),
+  notes: z.string().nullable(),
+  lastInteraction: z.number().nullable(),
+});
+
+const globalSearchResponseSchema = z.object({
+  query: z.string(),
+  /**
+   * Lexical tokens of `query`, from the same tokenizer the sparse index
+   * uses. Clients highlight these instead of re-tokenizing client-side.
+   */
+  queryTokens: z.array(z.string()),
+  results: z.object({
+    conversations: z.array(globalSearchConversationSchema),
+    memories: z.array(globalSearchMemorySchema),
+    schedules: z.array(globalSearchScheduleSchema),
+    contacts: z.array(globalSearchContactSchema),
+  }),
+});
+
+type GlobalSearchMemory = z.infer<typeof globalSearchMemorySchema>;
+type GlobalSearchSchedule = z.infer<typeof globalSearchScheduleSchema>;
+export type GlobalSearchResponse = z.infer<typeof globalSearchResponseSchema>;
+
+// ---------------------------------------------------------------------------
+// Category search helpers
+// ---------------------------------------------------------------------------
+
+const ALL_CATEGORIES = [
+  "conversations",
+  "memories",
+  "schedules",
+  "contacts",
+] as const;
+type Category = (typeof ALL_CATEGORIES)[number];
+
+function parseCategories(raw: string | undefined): Set<Category> {
+  if (!raw) {
+    return new Set(ALL_CATEGORIES);
+  }
+  const requested = raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter((s): s is Category => ALL_CATEGORIES.includes(s as Category));
+  return requested.length > 0 ? new Set(requested) : new Set(ALL_CATEGORIES);
+}
+
+/**
+ * Parse a search query string, extracting Slack / GitHub / Google-style
+ * filter tokens and returning the cleaned term plus the parsed filters.
+ *
+ * Currently supported filters:
+ *   `is:archived` / `archive:yes` / `archive:true`    — include archived rows
+ *   `is:unarchived` / `archive:no` / `archive:false`  — exclude archived rows
+ *
+ * Filters are case-insensitive, can appear in any position in the query, and
+ * are stripped from the returned `term`. Unknown filter tokens (`is:starred`,
+ * `from:@user`, etc.) are left in the term — the search backends treat the
+ * cleaned term as a literal query, so unknown filters are visible to lexical
+ * matching rather than silently dropped.
+ *
+ * Examples:
+ *   "foo bar"            -> { term: "foo bar",        archived: false }
+ *   "is:archived foo"    -> { term: "foo",            archived: true  }
+ *   "foo is:archived"    -> { term: "foo",            archived: true  }
+ *   "is:archived"        -> { term: "",               archived: true  }
+ *   "is:starred foo"     -> { term: "is:starred foo", archived: false }
+ */
+function parseSearchQuery(rawQ: string | undefined): {
+  term: string;
+  archived: boolean;
+} {
+  if (!rawQ) {
+    return { term: "", archived: false };
+  }
+  const tokens = rawQ.split(/\s+/).filter((t) => t.length > 0);
+  const termTokens: string[] = [];
+  let archived = false;
+  for (const tok of tokens) {
+    const lower = tok.toLowerCase();
+    if (
+      lower === "is:archived" ||
+      lower === "archive:yes" ||
+      lower === "archive:true"
+    ) {
+      archived = true;
+    } else if (
+      lower === "is:unarchived" ||
+      lower === "archive:no" ||
+      lower === "archive:false"
+    ) {
+      archived = false;
+    } else {
+      termTokens.push(tok);
+    }
+  }
+  return { term: termTokens.join(" "), archived };
+}
+
+function searchMemoryItems(query: string, limit: number): GlobalSearchMemory[] {
+  // The memory graph lives in the dedicated memory database. If it cannot be
+  // opened, degrade this category to empty rather than failing the whole
+  // federated search — conversations, schedules, and contacts still return.
+  if (!getMemorySqlite()) {
+    return [];
+  }
+
+  const likePattern = `%${query.replace(/%/g, "").replace(/_/g, "")}%`;
+
+  interface MemoryRow {
+    id: string;
+    type: string;
+    content: string;
+    confidence: number;
+    last_accessed: number;
+  }
+
+  const rows = rawMemoryAll<MemoryRow>(
+    "globalSearch:searchMemoryItems",
+    `SELECT id, type, content, confidence, last_accessed
+     FROM memory_graph_nodes
+     WHERE content LIKE ? AND fidelity != 'gone'
+     ORDER BY last_accessed DESC
+     LIMIT ?`,
+    likePattern,
+    limit,
+  );
+
+  return rows.map((r) => {
+    const nl = r.content.indexOf("\n");
+    const subject = nl >= 0 ? r.content.slice(0, nl) : r.content;
+    const statement = nl >= 0 ? r.content.slice(nl + 1) : r.content;
+    return {
+      id: r.id,
+      kind: r.type,
+      text: statement,
+      subject: subject || null,
+      confidence: r.confidence,
+      updatedAt: r.last_accessed,
+      source: "lexical" as const,
+    };
+  });
+}
+
+async function searchMemoriesSemantic(
+  query: string,
+  limit: number,
+  existingIds: Set<string>,
+): Promise<GlobalSearchMemory[]> {
+  const config = getConfig();
+  const backendStatus = await getMemoryBackendStatus(config);
+  if (!backendStatus.provider) {
+    return [];
+  }
+
+  try {
+    const embedded = await embedWithBackend(config, [query]);
+    const queryVector = embedded.vectors[0];
+    if (!queryVector) {
+      return [];
+    }
+
+    const candidates = await semanticSearch(
+      queryVector,
+      embedded.provider,
+      embedded.model,
+      limit,
+    );
+
+    const results: GlobalSearchMemory[] = [];
+    for (const c of candidates) {
+      if (c.type !== "item") {
+        continue;
+      }
+      if (existingIds.has(c.id)) {
+        continue;
+      }
+      results.push({
+        id: c.id,
+        kind: c.kind,
+        text: c.text,
+        subject: null,
+        confidence: c.confidence,
+        updatedAt: c.createdAt,
+        source: "semantic",
+      });
+    }
+    return results;
+  } catch (err) {
+    log.warn({ err }, "Deep semantic search failed, returning lexical only");
+    return [];
+  }
+}
+
+function searchScheduleJobs(
+  query: string,
+  limit: number,
+): GlobalSearchSchedule[] {
+  const all = listSchedules();
+  const q = query.toLowerCase();
+  const matched = all.filter(
+    (s) =>
+      s.name.toLowerCase().includes(q) || s.message.toLowerCase().includes(q),
+  );
+  return matched.slice(0, limit).map((s) => ({
+    id: s.id,
+    name: s.name,
+    expression: s.expression,
+    message: s.message,
+    enabled: s.enabled,
+    nextRunAt: s.enabled ? s.nextRunAt : null,
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Route handler
+// ---------------------------------------------------------------------------
+
+async function handleGlobalSearch({
+  queryParams = {},
+}: RouteHandlerArgs): Promise<GlobalSearchResponse> {
+  // A blank `q` is still rejected, but a query consisting solely of filter
+  // tokens (e.g. `is:archived`) is valid — it lists the archived set with an
+  // empty search term.
+  const rawQ = queryParams.q ?? "";
+  if (!rawQ.trim()) {
+    throw new BadRequestError("q query parameter is required");
+  }
+
+  // Pull the archive opt-in out of the query string itself (`is:archived` /
+  // `archive:yes` / etc.) so the user controls it the same way they control
+  // every other modifier: by typing it into the search box. The cleaned term
+  // is what the backends actually search on.
+  const { term, archived: includeArchived } = parseSearchQuery(rawQ);
+
+  const limit = Math.max(1, Math.min(Number(queryParams.limit ?? 20), 100));
+  const categories = parseCategories(queryParams.categories);
+  const deep = queryParams.deep === "true";
+
+  const results: GlobalSearchResponse["results"] = {
+    conversations: [],
+    memories: [],
+    schedules: [],
+    contacts: [],
+  };
+
+  if (categories.has("conversations")) {
+    const convResults = await searchConversations(term, {
+      limit,
+      maxMessagesPerConversation: 1,
+      includeArchived,
+    });
+    results.conversations = convResults.map((c) => ({
+      id: c.conversationId,
+      title: c.conversationTitle,
+      updatedAt: c.conversationUpdatedAt,
+      excerpt: c.matchingMessages[0]?.excerpt ?? "",
+      matchCount: c.matchingMessages.length,
+    }));
+  }
+
+  if (categories.has("memories")) {
+    results.memories = searchMemoryItems(term, limit);
+
+    if (deep) {
+      const existingIds = new Set(results.memories.map((m) => m.id));
+      const semanticResults = await searchMemoriesSemantic(
+        term,
+        limit,
+        existingIds,
+      );
+      results.memories = [...results.memories, ...semanticResults];
+    }
+  }
+
+  if (categories.has("schedules")) {
+    results.schedules = searchScheduleJobs(term, limit);
+  }
+
+  if (categories.has("contacts")) {
+    const contactResults = searchContacts({
+      query: term,
+      limit,
+    });
+    results.contacts = contactResults.map((c) => ({
+      id: c.id,
+      displayName: c.displayName,
+      notes: c.notes,
+      // Daemon-native search has no gateway-relayed read; recency orders on
+      // contacts.updatedAt, not the channel-derived lastInteraction column.
+      lastInteraction: c.updatedAt,
+    }));
+  }
+
+  return { query: term, queryTokens: tokenize(term), results };
+}
+
+// ---------------------------------------------------------------------------
+// Route definitions
+// ---------------------------------------------------------------------------
+
+export const ROUTES: RouteDefinition[] = [
+  {
+    operationId: "search_global",
+    endpoint: "search/global",
+    method: "GET",
+    policy: {
+      requiredScopes: ["chat.read"],
+      allowedPrincipalTypes: ACTOR_PRINCIPALS,
+    },
+    handler: handleGlobalSearch,
+    summary: "Global search",
+    description:
+      "Federated search across conversations, memories, schedules, and contacts.",
+    tags: ["search"],
+    queryParams: [
+      {
+        name: "q",
+        description: "Search query (required)",
+        required: true,
+      },
+      {
+        name: "limit",
+        type: "integer",
+        description: "Max results per category (1–100, default 20)",
+      },
+      {
+        name: "categories",
+        description: "Comma-separated categories to search",
+      },
+      {
+        name: "deep",
+        description: "Enable semantic search for memories (true/false)",
+      },
+    ],
+    responseBody: globalSearchResponseSchema,
+  },
+];

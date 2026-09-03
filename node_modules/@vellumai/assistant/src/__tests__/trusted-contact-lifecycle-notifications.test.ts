@@ -1,0 +1,506 @@
+/**
+ * Tests for M7: Trusted contact lifecycle notification signals.
+ *
+ * Verifies that all trusted contact lifecycle transitions emit proper
+ * notification signals via emitNotificationSignal():
+ *
+ * 1. request_submitted — when a non-member requests access (covered by
+ *    ingress.access_request, tested in non-member-access-request.test.ts)
+ * 2. guardian_decision — when the guardian approves or denies
+ * 3. verification_sent — when the verification code is created and delivered
+ * 4. activated — when the trusted contact successfully verifies
+ * 5. denied — when the guardian denies the request
+ */
+import { beforeEach, describe, expect, mock, test } from "bun:test";
+
+// ---------------------------------------------------------------------------
+// Test isolation: in-memory SQLite via temp directory
+// ---------------------------------------------------------------------------
+
+mock.module("../config/env.js", () => ({
+  isHttpAuthDisabled: () => true,
+  getGatewayInternalBaseUrl: () => "http://127.0.0.1:7830",
+}));
+
+// Track emitNotificationSignal calls
+const emitSignalCalls: Array<Record<string, unknown>> = [];
+mock.module("../notifications/emit-signal.js", () => ({
+  emitNotificationSignal: async (params: Record<string, unknown>) => {
+    emitSignalCalls.push(params);
+    return {
+      signalId: "mock-signal-id",
+      deduplicated: false,
+      dispatched: true,
+      reason: "mock",
+      deliveryResults: [],
+    };
+  },
+}));
+
+// Track deliverChannelReply calls
+const deliverReplyCalls: Array<{
+  url: string;
+  payload: Record<string, unknown>;
+}> = [];
+mock.module("../runtime/gateway-client.js", () => ({
+  deliverChannelReply: async (
+    url: string,
+    payload: Record<string, unknown>,
+  ) => {
+    deliverReplyCalls.push({ url, payload });
+  },
+}));
+
+// Gateway IPC mock — session lifecycle goes through the gateway session
+// client; delegate verification_sessions_* methods to the local-service sim
+// so these tests keep reading/writing the local test DB.
+mock.module("../ipc/gateway-client.js", () => ({
+  ipcCallPersistent: async (
+    method: string,
+    params?: Record<string, unknown>,
+  ) => {
+    const { handleVerificationSessionsIpc, isVerificationSessionsIpcMethod } =
+      await import("./helpers/verification-sessions-ipc-sim.js");
+    if (isVerificationSessionsIpcMethod(method)) {
+      return handleVerificationSessionsIpc(method, params);
+    }
+    return { ok: true };
+  },
+  ipcCall: async () => null,
+}));
+
+// Mock the approval conversation / copy generators so they return canned text.
+mock.module("../runtime/approval-message-composer.js", () => ({
+  composeApprovalMessage: () => "mock approval message",
+  composeApprovalMessageGenerative: async () => "mock generative message",
+}));
+
+import { createGuardianGatewaySim } from "./guardian-gateway-sim.js";
+
+const sim = createGuardianGatewaySim();
+mock.module("../channels/gateway-guardian-requests.js", () => sim.module);
+
+import { getResolver } from "../approvals/guardian-request-resolvers.js";
+import { getDb } from "../persistence/db-connection.js";
+import { initializeDb } from "../persistence/db-init.js";
+import {
+  handleChannelInbound,
+  seedContactChannel,
+} from "./helpers/channel-test-adapter.js";
+import { createGuardianBinding } from "./helpers/create-guardian-binding.js";
+import { resetGatewayAclStore } from "./helpers/gateway-acl-store.js";
+import { resetVerificationSessionsSim } from "./helpers/verification-sessions-ipc-sim.js";
+
+await initializeDb();
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const TEST_BEARER_TOKEN = "test-token";
+const GUARDIAN_APPROVAL_TTL_MS = 5 * 60 * 1000;
+
+function resetState(): void {
+  resetVerificationSessionsSim();
+  const db = getDb();
+  db.run("DELETE FROM channel_inbound_events");
+  db.run("DELETE FROM conversations");
+  db.run("DELETE FROM notification_events");
+  db.run("DELETE FROM contact_channels");
+  db.run("DELETE FROM contacts");
+  resetGatewayAclStore();
+  sim.reset();
+  emitSignalCalls.length = 0;
+  deliverReplyCalls.length = 0;
+}
+
+function buildInboundRequest(overrides: Record<string, unknown> = {}): Request {
+  const body: Record<string, unknown> = {
+    sourceChannel: "telegram",
+    interface: "telegram",
+    conversationExternalId: "chat-123",
+    externalMessageId: `msg-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`,
+    content: "Hello",
+    actorExternalId: "requester-user-456",
+    actorDisplayName: "Alice Requester",
+    actorUsername: "alice_req",
+    replyCallbackUrl: "http://localhost:7830/deliver/telegram",
+    ...overrides,
+  };
+
+  return new Request("http://localhost:8080/channels/inbound", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Gateway-Origin": TEST_BEARER_TOKEN,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Guardian decision signals (approve/deny)
+// ---------------------------------------------------------------------------
+
+describe("trusted contact lifecycle notification signals", () => {
+  beforeEach(() => {
+    resetState();
+  });
+
+  test("guardian deny emits guardian_decision and denied signals with display names", async () => {
+    // Set up guardian binding and member record (guardians must pass ACL)
+    createGuardianBinding({
+      channel: "telegram",
+      guardianExternalUserId: "guardian-user-789",
+      guardianDeliveryChatId: "guardian-chat-789",
+      guardianPrincipalId: "guardian-user-789",
+      verifiedVia: "test",
+    });
+    seedContactChannel({
+      sourceChannel: "telegram",
+      externalUserId: "guardian-user-789",
+      externalChatId: "guardian-chat-789",
+      status: "active",
+      policy: "allow",
+      displayName: "Guardian Bob",
+    });
+
+    // Set up requester contact with a display name so payloads are enriched
+    seedContactChannel({
+      sourceChannel: "telegram",
+      externalUserId: "requester-user-456",
+      externalChatId: "requester-chat-456",
+      status: "pending",
+      policy: "ask",
+      displayName: "Alice Requester",
+    });
+
+    const testRequestId = `req-deny-${Date.now()}`;
+
+    // Create a pending canonical access request
+    sim.seedRequest({
+      id: testRequestId,
+      kind: "access_request",
+      sourceType: "channel",
+      sourceChannel: "telegram",
+      sourceConversationId: "access-req-telegram-requester-user-456",
+      requesterExternalUserId: "requester-user-456",
+      requesterChatId: "requester-chat-456",
+      guardianExternalUserId: "guardian-user-789",
+      guardianPrincipalId: "guardian-user-789",
+      toolName: "ingress_access_request",
+      questionText: "Alice is requesting access",
+      expiresAt: Date.now() + GUARDIAN_APPROVAL_TTL_MS,
+    });
+
+    // Guardian denies via callback button
+    const guardianReq = buildInboundRequest({
+      conversationExternalId: "guardian-chat-789",
+      actorExternalId: "guardian-user-789",
+      actorDisplayName: "Guardian",
+      content: "",
+      callbackData: `apr:${testRequestId}:reject`,
+    });
+
+    await handleChannelInbound(guardianReq, undefined, TEST_BEARER_TOKEN);
+
+    // A denial emits exactly one lifecycle signal — guardian_decision with
+    // decision: "denied". A second event for the same verdict would escape
+    // dedupe (distinct keys) and duplicate the guardian-facing notification.
+    const guardianDecisionSignals = emitSignalCalls.filter(
+      (c) => c.sourceEventName === "ingress.trusted_contact.guardian_decision",
+    );
+    const deniedSignals = emitSignalCalls.filter(
+      (c) => c.sourceEventName === "ingress.trusted_contact.denied",
+    );
+
+    expect(guardianDecisionSignals.length).toBe(1);
+    expect(deniedSignals.length).toBe(0);
+
+    // Verify guardian_decision payload
+    const gdPayload = guardianDecisionSignals[0].contextPayload as Record<
+      string,
+      unknown
+    >;
+    expect(gdPayload.decision).toBe("denied");
+    expect(gdPayload.requesterExternalUserId).toBe("requester-user-456");
+    expect(gdPayload.decidedByExternalUserId).toBe("guardian-user-789");
+    expect(gdPayload.requesterDisplayName).toBe("Alice Requester");
+    expect(gdPayload.decidedByDisplayName).toBe("Guardian Bob");
+
+    expect(guardianDecisionSignals[0].dedupeKey).toContain(
+      "trusted-contact:guardian-decision:",
+    );
+  });
+
+  test("guardian approve emits guardian_decision and verification_sent signals with display names", async () => {
+    // Set up guardian binding and member record (guardians must pass ACL)
+    createGuardianBinding({
+      channel: "telegram",
+      guardianExternalUserId: "guardian-user-789",
+      guardianDeliveryChatId: "guardian-chat-789",
+      guardianPrincipalId: "guardian-user-789",
+      verifiedVia: "test",
+    });
+    seedContactChannel({
+      sourceChannel: "telegram",
+      externalUserId: "guardian-user-789",
+      externalChatId: "guardian-chat-789",
+      status: "active",
+      policy: "allow",
+      displayName: "Guardian Bob",
+    });
+
+    // Set up requester contact with a display name
+    seedContactChannel({
+      sourceChannel: "telegram",
+      externalUserId: "requester-user-456",
+      externalChatId: "requester-chat-456",
+      status: "pending",
+      policy: "ask",
+      displayName: "Alice Requester",
+    });
+
+    const testRequestId = `req-approve-${Date.now()}`;
+
+    // Create a pending canonical access request
+    sim.seedRequest({
+      id: testRequestId,
+      kind: "access_request",
+      sourceType: "channel",
+      sourceChannel: "telegram",
+      sourceConversationId: "access-req-telegram-requester-user-456",
+      requesterExternalUserId: "requester-user-456",
+      requesterChatId: "requester-chat-456",
+      guardianExternalUserId: "guardian-user-789",
+      guardianPrincipalId: "guardian-user-789",
+      toolName: "ingress_access_request",
+      questionText: "Alice is requesting access",
+      expiresAt: Date.now() + GUARDIAN_APPROVAL_TTL_MS,
+    });
+
+    // Guardian approves via callback button
+    const guardianReq = buildInboundRequest({
+      conversationExternalId: "guardian-chat-789",
+      actorExternalId: "guardian-user-789",
+      actorDisplayName: "Guardian",
+      content: "",
+      callbackData: `apr:${testRequestId}:approve_once`,
+    });
+
+    await handleChannelInbound(guardianReq, undefined, TEST_BEARER_TOKEN);
+
+    // guardian_decision should NOT fire at approval time when verification
+    // is still pending — it would cause the notification pipeline to send a
+    // premature "approved" message to the guardian's chat.
+    const guardianDecisionSignals = emitSignalCalls.filter(
+      (c) => c.sourceEventName === "ingress.trusted_contact.guardian_decision",
+    );
+    const verificationSentSignals = emitSignalCalls.filter(
+      (c) => c.sourceEventName === "ingress.trusted_contact.verification_sent",
+    );
+
+    expect(guardianDecisionSignals.length).toBe(0);
+    expect(verificationSentSignals.length).toBe(1);
+
+    // Verify verification_sent payload and that it's suppressed from delivery
+    const vsSignal = verificationSentSignals[0];
+    const vsPayload = vsSignal.contextPayload as Record<string, unknown>;
+    expect(vsPayload.requesterExternalUserId).toBe("requester-user-456");
+    expect(vsPayload.verificationSessionId).toBeDefined();
+    expect(vsPayload.requesterDisplayName).toBe("Alice Requester");
+    expect(vsPayload.decidedByDisplayName).toBe("Guardian Bob");
+    expect(
+      (vsSignal.attentionHints as Record<string, unknown>).visibleInSourceNow,
+    ).toBe(true);
+
+    // Should NOT emit denied signal
+    const deniedSignals = emitSignalCalls.filter(
+      (c) => c.sourceEventName === "ingress.trusted_contact.denied",
+    );
+    expect(deniedSignals.length).toBe(0);
+  });
+
+  test("deduplication keys prevent duplicate signals", async () => {
+    // Set up guardian binding and member record (guardians must pass ACL)
+    createGuardianBinding({
+      channel: "telegram",
+      guardianExternalUserId: "guardian-user-789",
+      guardianDeliveryChatId: "guardian-chat-789",
+      guardianPrincipalId: "guardian-user-789",
+      verifiedVia: "test",
+    });
+    seedContactChannel({
+      sourceChannel: "telegram",
+      externalUserId: "guardian-user-789",
+      externalChatId: "guardian-chat-789",
+      status: "active",
+      policy: "allow",
+    });
+
+    const testRequestId = `req-dedup-${Date.now()}`;
+
+    const approval = sim.seedRequest({
+      id: testRequestId,
+      kind: "access_request",
+      sourceType: "channel",
+      sourceChannel: "telegram",
+      sourceConversationId: "access-req-telegram-requester-user-456",
+      requesterExternalUserId: "requester-user-456",
+      requesterChatId: "requester-chat-456",
+      guardianExternalUserId: "guardian-user-789",
+      guardianPrincipalId: "guardian-user-789",
+      toolName: "ingress_access_request",
+      questionText: "Alice is requesting access",
+      expiresAt: Date.now() + GUARDIAN_APPROVAL_TTL_MS,
+    });
+
+    // All guardian_decision signals include the approval ID in the dedupe key
+    const guardianReq = buildInboundRequest({
+      conversationExternalId: "guardian-chat-789",
+      actorExternalId: "guardian-user-789",
+      actorDisplayName: "Guardian",
+      content: "",
+      callbackData: `apr:${testRequestId}:reject`,
+    });
+
+    await handleChannelInbound(guardianReq, undefined, TEST_BEARER_TOKEN);
+
+    const signals = emitSignalCalls.filter(
+      (c) =>
+        typeof c.dedupeKey === "string" &&
+        (c.dedupeKey as string).includes(approval.id),
+    );
+    // Exactly one lifecycle signal per denial, keyed on the request id.
+    expect(signals.length).toBe(1);
+    expect(signals[0].sourceEventName).toBe(
+      "ingress.trusted_contact.guardian_decision",
+    );
+  });
+
+  test("display name fields fall back to null when contacts have no display name", async () => {
+    // Set up guardian binding — createGuardianBinding creates a contact with
+    // displayName defaulting to the externalUserId. We need to verify the
+    // null-fallback path for display name resolution, so we use a guardian
+    // whose external user ID does NOT have a matching contact_channels row.
+    //
+    // Strategy: create the guardian binding normally (so the sender is
+    // classified as trustClass="guardian"), then use a DIFFERENT external
+    // user ID in the approval request's guardianExternalUserId field. The
+    // decidedByExternalUserId comes from actorExternalId (the real guardian),
+    // which DOES have a contact. To truly get null, we clear the guardian
+    // contact's displayName to empty string after creation — the signal
+    // enrichment code treats empty string the same as null for display
+    // purposes.
+    createGuardianBinding({
+      channel: "telegram",
+      guardianExternalUserId: "guardian-noname-111",
+      guardianDeliveryChatId: "guardian-chat-111",
+      guardianPrincipalId: "guardian-noname-111",
+      verifiedVia: "test",
+    });
+
+    // Clear the guardian contact's displayName to empty string so the
+    // display name resolution returns a falsy value. createGuardianBinding
+    // defaults displayName to the externalUserId, which would be a non-empty
+    // string and defeat the purpose of this test. The role column is
+    // gateway-owned now, so target the guardian contact by its seeded
+    // (externalUserId-derived) display name instead.
+    const db = getDb();
+    db.run(
+      "UPDATE contacts SET display_name = '' WHERE display_name = 'guardian-noname-111'",
+    );
+
+    // Do NOT create a requester contact — display name should resolve to null
+
+    const testRequestId = `req-noname-${Date.now()}`;
+
+    sim.seedRequest({
+      id: testRequestId,
+      kind: "access_request",
+      sourceType: "channel",
+      sourceChannel: "telegram",
+      sourceConversationId: "access-req-telegram-requester-noname-222",
+      requesterExternalUserId: "requester-noname-222",
+      requesterChatId: "requester-chat-222",
+      guardianExternalUserId: "guardian-noname-111",
+      guardianPrincipalId: "guardian-noname-111",
+      toolName: "ingress_access_request",
+      questionText: "Unknown user requesting access",
+      expiresAt: Date.now() + GUARDIAN_APPROVAL_TTL_MS,
+    });
+
+    // Guardian denies via callback button
+    const guardianReq = buildInboundRequest({
+      conversationExternalId: "guardian-chat-111",
+      actorExternalId: "guardian-noname-111",
+      actorDisplayName: "Guardian",
+      content: "",
+      callbackData: `apr:${testRequestId}:reject`,
+    });
+
+    await handleChannelInbound(guardianReq, undefined, TEST_BEARER_TOKEN);
+
+    const guardianDecisionSignals = emitSignalCalls.filter(
+      (c) => c.sourceEventName === "ingress.trusted_contact.guardian_decision",
+    );
+
+    expect(guardianDecisionSignals.length).toBe(1);
+
+    // Verify display names fall back to null/empty when contacts have no
+    // display name set.
+    const gdPayload = guardianDecisionSignals[0].contextPayload as Record<
+      string,
+      unknown
+    >;
+    expect(gdPayload.requesterDisplayName).toBeNull();
+    // Guardian contact exists but displayName was cleared to empty string.
+    // The signal enrichment resolves displayName from the contact record,
+    // so decidedByDisplayName will be "" (empty string) rather than null.
+    expect(gdPayload.decidedByDisplayName).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: Activated signal (trusted contact verification success)
+// ---------------------------------------------------------------------------
+
+describe("trusted contact activated notification signal", () => {
+  beforeEach(() => {
+    resetState();
+  });
+
+  test("guardian verification does NOT emit activated signal", async () => {
+    // Create an inbound challenge (guardian flow, not trusted contact)
+    const { createInboundVerificationSession } =
+      await import("./helpers/verification-sessions-ipc-sim.js");
+    const { secret } = createInboundVerificationSession("telegram");
+
+    // "Guardian" enters the verification code
+    const verifyReq = buildInboundRequest({
+      content: secret,
+      conversationExternalId: "guardian-chat-new",
+      actorExternalId: "guardian-user-new",
+    });
+
+    await handleChannelInbound(verifyReq, undefined, TEST_BEARER_TOKEN);
+
+    // Should NOT emit the trusted_contact.activated signal
+    const activatedSignals = emitSignalCalls.filter(
+      (c) => c.sourceEventName === "ingress.trusted_contact.activated",
+    );
+    expect(activatedSignals.length).toBe(0);
+  });
+
+  test("voice access_request resolver has registered handler for access_request kind", () => {
+    // The access_request resolver is registered during module load. When the
+    // source channel is 'voice', it should directly activate the member via
+    // upsertContactChannel (no verification session). This test validates the resolver
+    // is registered and accessible.
+    const resolver = getResolver("access_request");
+    expect(resolver).toBeDefined();
+    expect(resolver!.kind).toBe("access_request");
+  });
+});

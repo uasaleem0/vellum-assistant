@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "@vellumai/assistant": "0.11.7",
+    "@vellumai/cli": "0.11.7",
+    "@vellumai/credential-executor": "0.11.7",
+    "@vellumai/vellum-gateway": "0.11.7",
+    "@vellumai/web": "0.11.7"
+  }
+}

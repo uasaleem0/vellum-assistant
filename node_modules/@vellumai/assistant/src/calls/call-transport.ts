@@ -1,0 +1,101 @@
+/**
+ * Transport interface consumed by CallController for sending voice output
+ * and controlling call lifecycle.
+ *
+ * Decouples the controller from any specific wire protocol (e.g. Twilio
+ * Media Streams) so that alternative transports can be introduced without
+ * modifying controller logic.
+ */
+
+// ── Transport interface ──────────────────────────────────────────────
+
+/** Options for {@link CallTransport.sendTextToken}. */
+export interface SendTextTokenOptions {
+  /**
+   * The token is fixed, known-English system copy (error recovery, silence
+   * checks, duration warnings, deterministic prompts) rather than
+   * model-generated turn text. Transports that synthesize text themselves
+   * must not attach the caller-language hint to these tokens: a provider
+   * that enforces the hint would render the English words as though they
+   * were the caller's language. Model text keeps the hint.
+   */
+  systemCopy?: boolean;
+}
+
+/**
+ * Minimal output surface that CallController uses to send speech,
+ * audio, and lifecycle signals to the caller.
+ */
+export interface CallTransport {
+  /**
+   * Send a text token for TTS playback. When `last` is true the
+   * transport should signal end-of-turn to the caller.
+   */
+  sendTextToken(
+    token: string,
+    last: boolean,
+    opts?: SendTextTokenOptions,
+  ): void;
+
+  /**
+   * Send a pre-synthesized audio URL for playback.
+   */
+  sendPlayUrl(url: string): void;
+
+  /**
+   * Signal the transport to end the call session.
+   */
+  endSession(reason?: string): void;
+
+  /**
+   * When true, the transport synthesizes speech itself and requires raw
+   * PCM audio for playback.
+   *
+   * The media-stream transport sets this because its mu-law transcoder
+   * needs raw PCM — compressed formats (mp3, opus) produce garbled
+   * audio. The call controller uses this to request PCM from TTS
+   * providers and the audio store.
+   */
+  readonly requiresPcmAudio?: boolean;
+
+  /**
+   * Arm a one-shot callback invoked when the transport sends the first
+   * audio frame of queued playback to the caller.
+   *
+   * Transports that buffer text and synthesize asynchronously (e.g.
+   * media-stream) implement this so the controller can flip to the
+   * `speaking` state only when real outbound audio starts, rather than
+   * when tokens are merely buffered. Passing `null` disarms the signal.
+   * Transports that emit audio immediately may omit this.
+   */
+  setAudioStartCallback?(cb: (() => void) | null): void;
+
+  /**
+   * Discard any buffered, not-yet-queued text held by the transport.
+   *
+   * Called by the controller when it aborts an in-flight turn so the
+   * aborted turn's unsent text cannot leak into the next turn's
+   * synthesis. Transports that don't buffer text may omit this.
+   */
+  discardPendingText?(): void;
+
+  /**
+   * Cancel queued and in-flight speech playback held by the transport,
+   * including any audio already buffered downstream (e.g. by Twilio).
+   *
+   * Called by the controller when it aborts an in-flight turn so speech
+   * the aborted turn queued for synthesis or playback never plays over
+   * the next turn. Transports that emit speech synchronously may omit
+   * this.
+   */
+  cancelPendingSpeech?(): void;
+
+  /**
+   * Resolve once all queued speech has played out to the caller (the most
+   * recent end-of-turn boundary has been echoed back by the downstream
+   * transport). Used to gate end-of-call teardown so a goodbye is never cut
+   * off mid-sentence. Transports that play speech synchronously may omit
+   * this — the controller then treats playback as already drained.
+   */
+  awaitPlaybackDrained?(): Promise<void>;
+}

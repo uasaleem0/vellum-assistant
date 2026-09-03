@@ -1,0 +1,433 @@
+import { createHmac, timingSafeEqual } from "node:crypto";
+import type { Logger } from "pino";
+import { z } from "zod";
+import type { ConfigFileCache } from "../../config-file-cache.js";
+import type { GatewayConfig } from "../../config.js";
+import type { CredentialCache } from "../../credential-cache.js";
+import { credentialKey } from "../../credential-key.js";
+import {
+  resolveCredentialWithRefresh,
+  verifySecretWithRefresh,
+} from "../../credential-refresh.js";
+import { StringDedupCache } from "../../dedup-cache.js";
+import type { EmailReplySender } from "../../email/inbound-pipeline.js";
+import {
+  resolveEmailCredentialOrRelease,
+  runEmailInboundPipeline,
+} from "../../email/inbound-pipeline.js";
+import type { VellumEmailPayload } from "../../email/normalize.js";
+import {
+  evaluateSenderAuthentication,
+  parseEmailAddress,
+} from "../../email/normalize.js";
+import { getLogger } from "../../logger.js";
+import { readLimitedBody } from "../read-limited-body.js";
+
+const log = getLogger("resend-webhook");
+
+/**
+ * Maximum age (in seconds) for the svix-timestamp header before we reject
+ * the webhook as too old. Matches Svix's default tolerance of 5 minutes.
+ */
+const TIMESTAMP_TOLERANCE_SECONDS = 5 * 60;
+
+// ── Svix signature verification ─────────────────────────────────────
+
+/**
+ * Verify a Resend/Svix webhook signature.
+ *
+ * Svix signs webhooks with HMAC-SHA256 using the base64-decoded portion
+ * of the webhook secret (everything after the `whsec_` prefix).
+ *
+ * The signed content is: `${svix-id}.${svix-timestamp}.${rawBody}`
+ *
+ * The `svix-signature` header contains one or more space-delimited
+ * versioned signatures (e.g. `v1,<base64>`). We verify against all `v1`
+ * entries and succeed if any match.
+ */
+function verifySvixSignature(
+  headers: Headers,
+  rawBody: string,
+  secret: string,
+): boolean {
+  const msgId = headers.get("svix-id");
+  const timestamp = headers.get("svix-timestamp");
+  const signatureHeader = headers.get("svix-signature");
+
+  if (!msgId || !timestamp || !signatureHeader) return false;
+
+  // Reject stale timestamps to prevent replay attacks
+  const ts = parseInt(timestamp, 10);
+  if (isNaN(ts)) return false;
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - ts) > TIMESTAMP_TOLERANCE_SECONDS) return false;
+
+  // Extract the raw key bytes — secret may have a `whsec_` prefix
+  const secretPart = secret.startsWith("whsec_") ? secret.slice(6) : secret;
+  const secretBytes = Buffer.from(secretPart, "base64");
+
+  // Compute expected signature
+  const signedContent = `${msgId}.${timestamp}.${rawBody}`;
+  const expectedSig = createHmac("sha256", secretBytes)
+    .update(signedContent, "utf8")
+    .digest("base64");
+
+  // svix-signature may contain multiple space-delimited entries like
+  // "v1,<base64> v1,<base64> v2,<base64>"
+  const signatures = signatureHeader.split(" ");
+  for (const entry of signatures) {
+    const [version, sig] = entry.split(",", 2);
+    if (version !== "v1" || !sig) continue;
+
+    const expectedBuf = Buffer.from(expectedSig);
+    const providedBuf = Buffer.from(sig);
+    if (expectedBuf.length !== providedBuf.length) continue;
+
+    if (timingSafeEqual(expectedBuf, providedBuf)) return true;
+  }
+
+  return false;
+}
+
+// ── Resend inbound payload normalization ────────────────────────────
+
+const optionalString = () => z.string().optional().catch(undefined);
+
+/**
+ * Shape of the Resend `email.received` webhook event — untrusted external input
+ * from Resend/Svix. Field types are validated while staying tolerant: a
+ * malformed value collapses to `undefined` so the existing null-checks drop an
+ * unprocessable event rather than trusting garbage (e.g. a non-array `to`).
+ *
+ * The webhook payload contains metadata only — the email body must be
+ * fetched separately via `GET /emails/receiving/{email_id}`.
+ */
+const resendReceivedEventSchema = z.object({
+  type: z.literal("email.received"),
+  created_at: optionalString(),
+  data: z.object({
+    email_id: optionalString(),
+    created_at: optionalString(),
+    from: optionalString(),
+    to: z.array(z.string()).optional().catch(undefined),
+    cc: z.array(z.string()).optional().catch(undefined),
+    bcc: z.array(z.string()).optional().catch(undefined),
+    subject: optionalString(),
+    message_id: optionalString(),
+    attachments: z
+      .array(
+        z.object({
+          id: optionalString(),
+          filename: optionalString(),
+          content_type: optionalString(),
+        }),
+      )
+      .optional()
+      .catch(undefined),
+  }),
+});
+type ResendReceivedEvent = z.infer<typeof resendReceivedEventSchema>;
+
+/**
+ * Fetch the full email content from the Resend Receiving API.
+ *
+ * Returns the email body (html/text), headers, and metadata.
+ */
+async function fetchResendEmailContent(
+  emailId: string,
+  apiKey: string,
+): Promise<{
+  html: string | null;
+  text: string | null;
+  headers: Record<string, string>;
+} | null> {
+  try {
+    const response = await fetch(
+      `https://api.resend.com/emails/receiving/${emailId}`,
+      {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      },
+    );
+    if (!response.ok) {
+      log.error(
+        { emailId, status: response.status },
+        "Failed to fetch Resend email content",
+      );
+      return null;
+    }
+    const data = (await response.json()) as Record<string, unknown>;
+    const headers: Record<string, string> = {};
+    if (data.headers && typeof data.headers === "object") {
+      for (const [k, v] of Object.entries(
+        data.headers as Record<string, string>,
+      )) {
+        headers[k.toLowerCase()] = v;
+      }
+    }
+    return {
+      html: (data.html as string) ?? null,
+      text: (data.text as string) ?? null,
+      headers,
+    };
+  } catch (err) {
+    log.error({ err, emailId }, "Error fetching Resend email content");
+    return null;
+  }
+}
+
+/**
+ * Normalize a Resend `email.received` webhook event into a
+ * `VellumEmailPayload` suitable for `normalizeEmailWebhook()`.
+ */
+export function normalizeResendToVellumPayload(
+  event: ResendReceivedEvent,
+  content: {
+    html: string | null;
+    text: string | null;
+    headers: Record<string, string>;
+  } | null,
+): VellumEmailPayload | null {
+  const { data } = event;
+  if (!data.from || !data.to?.length || !data.message_id) return null;
+
+  // Extract threading headers from the full email content if available
+  const inReplyTo = content?.headers["in-reply-to"] ?? undefined;
+  const references = content?.headers["references"] ?? undefined;
+
+  // Use the first 'to' address as the recipient for routing
+  const recipientAddress = data.to[0];
+
+  // Derive a stable conversation ID using the root of the References
+  // chain (first entry = thread root Message-ID per RFC 5322). This
+  // ensures all replies in a thread resolve to the same conversation.
+  // Falls back to recipientAddress for new threads with no References.
+  const referencesRoot = references?.trim().split(/\s+/)[0];
+  const conversationId = referencesRoot ?? recipientAddress;
+
+  // Prefer plain text; fall back to raw HTML so HTML-only emails aren't empty
+  const bodyText = content?.text ?? content?.html ?? undefined;
+  const strippedText = content?.text ?? undefined;
+
+  // Parse from into canonical address + optional display name
+  const parsed = parseEmailAddress(data.from);
+
+  // Bind the spoofable From: to the receiving API's SPF/DKIM/DMARC verdict
+  // (fetchResendEmailContent lowercases header keys) so a forged sender is
+  // downgraded out of the guardian/contact tiers. Omitted (not false) when the
+  // header is absent — e.g. the content fetch failed — so behavior is unchanged
+  // on missing data.
+  const senderAuthenticated = evaluateSenderAuthentication({
+    authResults: content?.headers["authentication-results"],
+    fromEmail: parsed.address,
+  });
+
+  return {
+    from: parsed.address,
+    fromName: parsed.displayName,
+    to: recipientAddress,
+    subject: data.subject,
+    strippedText,
+    bodyText,
+    messageId: data.message_id,
+    inReplyTo,
+    references,
+    conversationId,
+    timestamp: data.created_at,
+    ...(senderAuthenticated !== undefined ? { senderAuthenticated } : {}),
+  };
+}
+
+// ── Reply delivery ──────────────────────────────────────────────────
+
+/** Reply sender using the Resend Emails API. */
+function buildResendReplySender(apiKey: string, log: Logger): EmailReplySender {
+  return async ({ kind, from, to, subject, text, inReplyTo }) => {
+    try {
+      const sendResponse = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from,
+          to: [to],
+          subject,
+          text,
+          ...(inReplyTo
+            ? {
+                headers: {
+                  "In-Reply-To": inReplyTo,
+                },
+              }
+            : {}),
+        }),
+      });
+      if (sendResponse.ok) {
+        log.info({ from, to }, `Sent ${kind} reply via Resend`);
+      } else {
+        log.warn(
+          { status: sendResponse.status, from, to },
+          `Failed to send ${kind} reply via Resend`,
+        );
+      }
+    } catch (err) {
+      log.error({ err, from, to }, `Error sending ${kind} reply via Resend`);
+    }
+  };
+}
+
+// ── Webhook handler factory ─────────────────────────────────────────
+
+export function createResendWebhookHandler(
+  config: GatewayConfig,
+  caches?: { credentials?: CredentialCache; configFile?: ConfigFileCache },
+) {
+  const dedupCache = new StringDedupCache(24 * 60 * 60_000);
+
+  const handler = async (req: Request): Promise<Response> => {
+    const traceId = req.headers.get("x-trace-id") ?? undefined;
+    const tlog = traceId ? log.child({ traceId }) : log;
+
+    if (req.method !== "POST") {
+      return Response.json({ error: "Method not allowed" }, { status: 405 });
+    }
+
+    // Cap body buffering before the (unauthenticated) signature check; a
+    // header-only guard is bypassable via chunked / absent Content-Length.
+    const bodyResult = await readLimitedBody(
+      req,
+      config.maxWebhookPayloadBytes,
+    );
+    if (bodyResult.status === "too_large") {
+      tlog.warn("Resend webhook payload too large");
+      return Response.json({ error: "Payload too large" }, { status: 413 });
+    }
+    if (bodyResult.status === "unreadable") {
+      return Response.json({ error: "Failed to read body" }, { status: 400 });
+    }
+    const rawBody = bodyResult.text;
+
+    // ── Credential resolution ───────────────────────────────────────
+    // We need two credentials:
+    //   resend/webhook_secret — for Svix signature verification
+    //   resend/api_key        — for fetching email content from the API
+
+    const webhookSecret = await resolveCredentialWithRefresh(
+      caches?.credentials,
+      credentialKey("resend", "webhook_secret"),
+    );
+
+    if (!webhookSecret) {
+      tlog.warn("Resend webhook secret not configured — rejecting request");
+      return Response.json(
+        { error: "Webhook secret not configured" },
+        { status: 409 },
+      );
+    }
+
+    // ── Signature verification ──────────────────────────────────────
+
+    const signatureValid = await verifySecretWithRefresh({
+      credentials: caches?.credentials,
+      key: credentialKey("resend", "webhook_secret"),
+      verify: (secret) => verifySvixSignature(req.headers, rawBody, secret),
+      log: tlog,
+      label: "Resend webhook signature",
+    });
+
+    if (!signatureValid) {
+      tlog.warn("Resend webhook signature verification failed");
+      return Response.json({ error: "Forbidden" }, { status: 403 });
+    }
+
+    // ── Parse event ─────────────────────────────────────────────────
+
+    let event: ResendReceivedEvent;
+    try {
+      const parsed = JSON.parse(rawBody) as Record<string, unknown>;
+      if (parsed.type !== "email.received") {
+        // Acknowledge non-email events silently (delivery status, bounces, etc.)
+        tlog.debug({ type: parsed.type }, "Ignoring non-received Resend event");
+        return Response.json({ ok: true });
+      }
+      const validated = resendReceivedEventSchema.safeParse(parsed);
+      if (!validated.success) {
+        // An `email.received` event whose payload is unusable carries nothing
+        // to process — acknowledge without forwarding, as Resend expects a 2xx.
+        tlog.debug("Ignoring malformed Resend email.received event");
+        return Response.json({ ok: true });
+      }
+      event = validated.data;
+    } catch {
+      return Response.json({ error: "Invalid JSON" }, { status: 400 });
+    }
+
+    const emailId = event.data?.email_id;
+    const messageId = event.data?.message_id;
+
+    if (!emailId || !messageId) {
+      tlog.debug("Resend event missing email_id or message_id, acknowledging");
+      return Response.json({ ok: true });
+    }
+
+    // Dedup by message ID
+    if (!dedupCache.reserve(messageId)) {
+      tlog.info({ messageId }, "Duplicate Resend event, ignoring");
+      return Response.json({ ok: true });
+    }
+
+    // ── Fetch email content ─────────────────────────────────────────
+    // The webhook payload only has metadata — we need the API to get
+    // the actual email body and headers.
+
+    const apiKeyResult = await resolveEmailCredentialOrRelease({
+      credentials: caches?.credentials,
+      key: credentialKey("resend", "api_key"),
+      dedupCache,
+      dedupKey: messageId,
+      log: tlog,
+      label: "Resend",
+    });
+    if (!apiKeyResult.ok) {
+      return apiKeyResult.response;
+    }
+    const apiKey = apiKeyResult.value;
+
+    let emailContent: Awaited<ReturnType<typeof fetchResendEmailContent>> =
+      null;
+    if (apiKey) {
+      emailContent = await fetchResendEmailContent(emailId, apiKey);
+    } else {
+      tlog.warn(
+        "Resend API key not configured — email body will be unavailable",
+      );
+    }
+
+    // ── Normalize to VellumEmailPayload ─────────────────────────────
+
+    const vellumPayload = normalizeResendToVellumPayload(event, emailContent);
+    if (!vellumPayload) {
+      tlog.debug("Resend event missing required fields, acknowledging");
+      dedupCache.mark(messageId);
+      return Response.json({ ok: true });
+    }
+
+    // ── Forward through the shared email pipeline ───────────────────
+
+    return runEmailInboundPipeline({
+      config,
+      log: tlog,
+      label: "Resend",
+      source: "resend",
+      dedupCache,
+      dedupKey: messageId,
+      vellumPayload,
+      traceId,
+      sendReply: apiKey ? buildResendReplySender(apiKey, tlog) : undefined,
+      logFields: { emailId },
+    });
+  };
+
+  return { handler, dedupCache };
+}

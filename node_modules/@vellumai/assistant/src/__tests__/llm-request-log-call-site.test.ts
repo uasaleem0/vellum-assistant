@@ -1,0 +1,118 @@
+/**
+ * Tests for the `call_site` column on `llm_request_logs`. The column is
+ * stamped by `recordRequestLog` at insertion time and surfaces in
+ * `LogRow.callSite`. Historical rows (pre-migration 264) stay NULL —
+ * "we don't know" rather than guessing `mainAgent`.
+ */
+import { beforeEach, describe, expect, test } from "bun:test";
+
+import { getLogsDb, getSqliteFrom } from "../persistence/db-connection.js";
+import { initializeDb } from "../persistence/db-init.js";
+import {
+  getRequestLogById,
+  recordRequestLog,
+} from "../persistence/llm-request-log-store.js";
+import { migrateLlmRequestLogCallSite } from "../persistence/migrations/264-llm-request-log-call-site.js";
+import { llmRequestLogs } from "../persistence/schema/index.js";
+
+await initializeDb();
+
+// llm_request_logs lives in the dedicated logs connection.
+function resetLogs(): void {
+  getLogsDb()!.delete(llmRequestLogs).run();
+}
+
+describe("recordRequestLog call_site stamping", () => {
+  beforeEach(resetLogs);
+
+  test("stamps callSite when provided", () => {
+    const id = recordRequestLog(
+      "conv-1",
+      '{"req":1}',
+      '{"res":1}',
+      undefined,
+      "anthropic",
+      "mainAgent",
+    );
+    const row = getRequestLogById(id!);
+    expect(row).not.toBeNull();
+    expect(row!.callSite).toBe("mainAgent");
+  });
+
+  test("leaves callSite NULL when omitted (backward compat)", () => {
+    const id = recordRequestLog("conv-1", '{"req":1}', '{"res":1}');
+    const row = getRequestLogById(id!);
+    expect(row).not.toBeNull();
+    expect(row!.callSite).toBeNull();
+  });
+
+  test("supports the compactionAgent value", () => {
+    const id = recordRequestLog(
+      "conv-1",
+      '{"req":1}',
+      '{"res":1}',
+      undefined,
+      "anthropic",
+      "compactionAgent",
+    );
+    expect(getRequestLogById(id!)?.callSite).toBe("compactionAgent");
+  });
+
+  test("two rows in the same conversation can carry different callSites", () => {
+    const mainId = recordRequestLog(
+      "conv-1",
+      '{"req":1}',
+      '{"res":1}',
+      undefined,
+      "anthropic",
+      "mainAgent",
+    );
+    const compactId = recordRequestLog(
+      "conv-1",
+      '{"req":2}',
+      '{"res":2}',
+      undefined,
+      "anthropic",
+      "compactionAgent",
+    );
+    expect(getRequestLogById(mainId!)?.callSite).toBe("mainAgent");
+    expect(getRequestLogById(compactId!)?.callSite).toBe("compactionAgent");
+  });
+});
+
+describe("migrateLlmRequestLogCallSite", () => {
+  test("adds the call_site column when missing", () => {
+    const db = getLogsDb()!;
+    const raw = getSqliteFrom(db);
+
+    // Drop the column if present (simulate pre-264 state). SQLite supports
+    // `DROP COLUMN` since 3.35 (June 2021) — bun-sqlite ships well past that.
+    const before = raw
+      .query(`PRAGMA table_info(llm_request_logs)`)
+      .all() as Array<{ name: string }>;
+    if (before.some((c) => c.name === "call_site")) {
+      raw.exec(`ALTER TABLE llm_request_logs DROP COLUMN call_site`);
+    }
+
+    const without = raw
+      .query(`PRAGMA table_info(llm_request_logs)`)
+      .all() as Array<{ name: string }>;
+    expect(without.some((c) => c.name === "call_site")).toBe(false);
+
+    migrateLlmRequestLogCallSite(db);
+
+    const after = raw
+      .query(`PRAGMA table_info(llm_request_logs)`)
+      .all() as Array<{ name: string }>;
+    expect(after.some((c) => c.name === "call_site")).toBe(true);
+  });
+
+  test("is idempotent — second run is a no-op", () => {
+    const db = getLogsDb()!;
+    // First run (column may or may not exist depending on test order; either
+    // path is fine for the idempotency contract).
+    migrateLlmRequestLogCallSite(db);
+    // Second run must not throw.
+    expect(() => migrateLlmRequestLogCallSite(db)).not.toThrow();
+  });
+});

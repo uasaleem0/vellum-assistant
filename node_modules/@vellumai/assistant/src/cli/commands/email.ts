@@ -1,0 +1,768 @@
+import {
+  createWriteStream,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { createRequire } from "node:module";
+import { basename, join } from "node:path";
+
+import type { Command } from "commander";
+
+import {
+  cliIpcCall,
+  cliIpcCallStream,
+  exitFromIpcResult,
+} from "../../ipc/cli-client.js";
+import { guessMimeType } from "../../util/mime-type.js";
+import { readStdinSync } from "../../util/read-stdin.js";
+import { resolveBundledCliModule } from "../bundled-modules.js";
+import { applyCommandHelp, subcommand } from "../lib/cli-command-help.js";
+import { registerCommand } from "../lib/register-command.js";
+import { getCliLogger } from "../logger.js";
+import { shouldOutputJson, writeOutput } from "../output.js";
+import { emailHelp } from "./email.help.js";
+
+const loadModule = createRequire(import.meta.url);
+
+const log = getCliLogger("email");
+
+/**
+ * Handle an IPC error in the email command. In --json mode, writes a
+ * `{"error": "..."}` envelope to stdout so callers can parse it. In all
+ * modes, sets a non-zero exit code without calling process.exit() so tests
+ * using runAssistantCommandFull can inspect the exit code after the call.
+ */
+function handleEmailIpcError(
+  r: { ok: false; error?: string; statusCode?: number },
+  cmd: Command,
+): void {
+  const exitCode =
+    r.statusCode == null
+      ? 10
+      : r.statusCode >= 500
+        ? 3
+        : r.statusCode >= 400
+          ? 2
+          : 1;
+  if (shouldOutputJson(cmd)) {
+    process.stdout.write(
+      JSON.stringify({ error: r.error ?? "Unknown error" }) + "\n",
+    );
+    process.exitCode = exitCode;
+    return;
+  }
+  exitFromIpcResult(r, cmd);
+}
+
+/**
+ * Loaded lazily because config/env pulls the full config-loader graph. Sync
+ * require rather than import(): commander invokes help-text callbacks
+ * synchronously, so there is no place to await a module load.
+ */
+function assistantDomain(): string {
+  const { getAssistantDomain } = resolveBundledCliModule(
+    "configEnv",
+    () =>
+      loadModule("../../config/env.js") as typeof import("../../config/env.js"),
+  );
+  return getAssistantDomain();
+}
+
+export function registerEmailCommand(program: Command): void {
+  registerCommand(program, {
+    name: emailHelp.name,
+    transport: "ipc",
+    description: emailHelp.description,
+    build: (email) => {
+      applyCommandHelp(email, emailHelp);
+
+      // The per-subcommand help texts that interpolate the assistant domain
+      // are runtime-computed (lazy config load), so they stay imperative
+      // here rather than in the declarative help module.
+      subcommand(email, "register")
+        .addHelpText(
+          "after",
+          () => `
+Arguments:
+  username   The local part of the email address (e.g. "mybot" → mybot@${assistantDomain()})
+
+Registers a new email address on the Vellum platform for the current
+assistant. Each assistant can have one email address. The address is
+immediately active for receiving inbound email.
+
+Examples:
+  $ assistant email register mybot
+  ✓ Registered mybot@${assistantDomain()}
+
+  $ assistant email register support --json
+  {"address":"support@${assistantDomain()}","id":"...","created_at":"..."}`,
+        )
+        .action(async (username: string, _opts: unknown, cmd: Command) => {
+          const r = await cliIpcCall<{
+            id: string;
+            address: string;
+            created_at: string;
+          }>("email_register", { body: { username } });
+          if (!r.ok) {
+            return handleEmailIpcError(
+              { ok: false, error: r.error, statusCode: r.statusCode },
+              cmd,
+            );
+          }
+          if (shouldOutputJson(cmd)) {
+            writeOutput(cmd, r.result);
+          } else {
+            log.info(`✓ Registered ${r.result!.address}`);
+          }
+        });
+
+      subcommand(email, "unregister")
+        .addHelpText(
+          "after",
+          () => `
+Removes the email address currently registered for this assistant.
+The address is deactivated immediately — inbound email will no longer
+be delivered. The username enters a cooldown period and is not
+immediately available for reuse.
+
+Examples:
+  $ assistant email unregister
+  Remove mybot@${assistantDomain()}? (y/N) y
+  ✓ Unregistered mybot@${assistantDomain()}
+
+  $ assistant email unregister --confirm
+  ✓ Unregistered mybot@${assistantDomain()}
+
+  $ assistant email unregister --json
+  {"unregistered":"mybot@${assistantDomain()}"}`,
+        )
+        .action(async (_opts: { confirm?: boolean }, cmd: Command) => {
+          if (!_opts.confirm && !shouldOutputJson(cmd)) {
+            const rl = await import("node:readline");
+            // We need to get the address to show in the prompt, but we can't
+            // know it without making an IPC call. Use a generic prompt here.
+            const iface = rl.createInterface({
+              input: process.stdin,
+              output: process.stderr,
+            });
+            const answer = await new Promise<string>((resolve) => {
+              iface.question(
+                `Remove registered email address? (y/N) `,
+                resolve,
+              );
+            });
+            iface.close();
+            if (answer.trim().toLowerCase() !== "y") {
+              log.info("Cancelled.");
+              return;
+            }
+          }
+          const r = await cliIpcCall<{ unregistered: string }>(
+            "email_unregister",
+            {},
+          );
+          if (!r.ok) {
+            return handleEmailIpcError(
+              { ok: false, error: r.error, statusCode: r.statusCode },
+              cmd,
+            );
+          }
+          if (shouldOutputJson(cmd)) {
+            writeOutput(cmd, r.result);
+          } else {
+            log.info(`✓ Unregistered ${r.result!.unregistered}`);
+          }
+        });
+
+      subcommand(email, "status")
+        .addHelpText(
+          "after",
+          () => `
+Shows the email address registered for this assistant along with
+current usage and quota information from the platform.
+
+Examples:
+  $ assistant email status
+  Address:  hi@mybot.${assistantDomain()}
+  Status:   active
+  Since:    2026-04-15
+  Sent:     12 / 100 (daily)
+  Received: 5 (today)
+  Monthly:  42 sent, 18 received
+
+  $ assistant email status --json
+  {"address":"hi@mybot.${assistantDomain()}","status":"active","created_at":"2026-04-15T...","usage":{...}}`,
+        )
+        .action(async (_opts: unknown, cmd: Command) => {
+          const r = await cliIpcCall<{
+            address: string;
+            status: string;
+            created_at: string;
+            usage: {
+              sent_today: number;
+              daily_limit: number;
+              received_today: number;
+              sent_this_month: number;
+              received_this_month: number;
+            };
+          }>("email_status", {});
+          if (!r.ok) {
+            return handleEmailIpcError(
+              { ok: false, error: r.error, statusCode: r.statusCode },
+              cmd,
+            );
+          }
+          const statusData = r.result!;
+          if (shouldOutputJson(cmd)) {
+            writeOutput(cmd, statusData);
+          } else {
+            log.info(`Address:  ${statusData.address}`);
+            log.info(`Status:   ${statusData.status}`);
+            log.info(`Since:    ${statusData.created_at.split("T")[0]}`);
+            if (statusData.usage) {
+              log.info(
+                `Sent:     ${statusData.usage.sent_today} / ${statusData.usage.daily_limit} (daily)`,
+              );
+              log.info(`Received: ${statusData.usage.received_today} (today)`);
+              log.info(
+                `Monthly:  ${statusData.usage.sent_this_month} sent, ${statusData.usage.received_this_month} received`,
+              );
+            }
+          }
+        });
+
+      subcommand(email, "list").action(
+        async (
+          opts: {
+            direction?: string;
+            limit?: string;
+            since?: string;
+          },
+          cmd: Command,
+        ) => {
+          const params: Record<string, string> = {};
+          if (opts.direction && opts.direction !== "all") {
+            params.direction = opts.direction;
+          }
+          if (opts.limit) {
+            params.limit = opts.limit;
+          }
+          if (opts.since) {
+            params.since = opts.since;
+          }
+
+          const r = await cliIpcCall<{
+            results: {
+              id: string;
+              direction: string;
+              from_address: string;
+              to_addresses: string[];
+              subject: string;
+              created_at: string;
+            }[];
+            count: number;
+          }>("email_list", { queryParams: params });
+          if (!r.ok) {
+            return handleEmailIpcError(
+              { ok: false, error: r.error, statusCode: r.statusCode },
+              cmd,
+            );
+          }
+          const data = r.result!;
+          if (shouldOutputJson(cmd)) {
+            writeOutput(cmd, data);
+          } else {
+            const messages = data.results ?? [];
+            if (messages.length === 0) {
+              log.info("No email messages found.");
+            } else {
+              for (const msg of messages) {
+                const dir = msg.direction === "inbound" ? "←" : "→";
+                const to = Array.isArray(msg.to_addresses)
+                  ? msg.to_addresses.join(", ")
+                  : "";
+                const date = new Date(msg.created_at).toLocaleString();
+                log.info(
+                  `${dir} ${date}  ${msg.from_address} → ${to}  "${msg.subject || "(no subject)"}"`,
+                );
+              }
+              log.info(`\n${data.count} total message(s)`);
+            }
+          }
+        },
+      );
+
+      subcommand(email, "download")
+        .addHelpText(
+          "after",
+          () => `
+Arguments:
+  message-id   Email message ID (from \`assistant email list --json\`)
+
+Downloads a specific email message by ID. The default format shows
+headers and the plain-text body. Use --format html for the HTML body,
+or --format json for the full message object.
+
+Examples:
+  $ assistant email download msg_abc123
+  From:    user@example.com
+  To:      mybot@${assistantDomain()}
+  Subject: Hello
+  Date:    2026-04-05 12:00:00
+
+  Hi, this is a test message.
+
+  $ assistant email download msg_abc123 --format json
+  {"id":"msg_abc123","direction":"inbound",...}
+
+  $ assistant email download msg_abc123 -o email.txt
+  ✓ Saved to email.txt`,
+        )
+        .action(
+          async (
+            messageId: string,
+            opts: {
+              format?: string;
+              output?: string;
+            },
+            cmd: Command,
+          ) => {
+            const r = await cliIpcCall<{
+              id: string;
+              direction: string;
+              from_address: string;
+              to_addresses: string[];
+              subject: string;
+              body_text: string;
+              body_html: string;
+              in_reply_to: string;
+              references: string[];
+              created_at: string;
+            }>("email_download", { queryParams: { messageId } });
+            if (!r.ok) {
+              return handleEmailIpcError(
+                { ok: false, error: r.error, statusCode: r.statusCode },
+                cmd,
+              );
+            }
+            const msg = r.result!;
+
+            const fmt = opts.format ?? "text";
+
+            let content: string;
+            if (fmt === "json" || shouldOutputJson(cmd)) {
+              content = JSON.stringify(msg, null, 2) + "\n";
+            } else if (fmt === "html") {
+              if (!msg.body_html) {
+                log.error("No HTML body available for this message.");
+                process.exitCode = 1;
+                return;
+              }
+              content = msg.body_html;
+            } else {
+              // text format: headers + body
+              const to = Array.isArray(msg.to_addresses)
+                ? msg.to_addresses.join(", ")
+                : "";
+              const date = new Date(msg.created_at).toLocaleString();
+              const lines = [
+                `From:    ${msg.from_address}`,
+                `To:      ${to}`,
+                `Subject: ${msg.subject || "(no subject)"}`,
+                `Date:    ${date}`,
+              ];
+              if (msg.in_reply_to) {
+                lines.push(`In-Reply-To: ${msg.in_reply_to}`);
+              }
+              lines.push("", msg.body_text || "(no plain-text body)");
+              content = lines.join("\n") + "\n";
+            }
+
+            if (opts.output) {
+              try {
+                writeFileSync(opts.output, content, "utf-8");
+              } catch (err) {
+                log.error(
+                  `Failed to write --output ${opts.output}: ${err instanceof Error ? err.message : String(err)}`,
+                );
+                process.exitCode = 1;
+                return;
+              }
+              if (!shouldOutputJson(cmd)) {
+                log.info(`✓ Saved to ${opts.output}`);
+              } else {
+                writeOutput(cmd, { saved: opts.output, bytes: content.length });
+              }
+            } else {
+              process.stdout.write(content);
+            }
+          },
+        );
+
+      // --cc / --bcc accumulate repeated flags into an array with an `[]`
+      // default. CliOptionHelp can only express scalar defaults and no parse
+      // functions, so the accumulator parser and array default are attached
+      // imperatively to the declaratively-registered options.
+      const send = subcommand(email, "send");
+      const collect = (val: string, prev: string[]) => [...prev, val];
+      for (const flags of [
+        "--cc <address>",
+        "--bcc <address>",
+        "--attach <path>",
+      ]) {
+        const option = send.options.find((o) => o.flags === flags);
+        if (!option) {
+          throw new Error(
+            `Option "${flags}" not found on "email send" — is it declared in email.help.ts?`,
+          );
+        }
+        option.argParser(collect).default([] as string[]);
+        send.setOptionValueWithSource(option.attributeName(), [], "default");
+      }
+      send.action(
+        async (
+          to: string[],
+          opts: {
+            subject?: string;
+            body?: string;
+            file?: string;
+            html?: string;
+            cc?: string[];
+            bcc?: string[];
+            attach?: string[];
+            replyTo?: string;
+          },
+          cmd: Command,
+        ) => {
+          // Resolve body text: --body > --file > stdin
+          let text = opts.body;
+          if (!text && opts.file) {
+            try {
+              text = readFileSync(opts.file, "utf-8");
+            } catch (err) {
+              log.error(
+                `Failed to read --file ${opts.file}: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              process.exitCode = 1;
+              return;
+            }
+          }
+          if (!text && !process.stdin.isTTY) {
+            try {
+              text = readStdinSync();
+            } catch (err) {
+              log.error(
+                `Failed to read body from stdin: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              process.exitCode = 1;
+              return;
+            }
+          }
+          if (!text) {
+            log.error(
+              "Email body is required. Use --body, --file, or pipe via stdin.",
+            );
+            process.exitCode = 1;
+            return;
+          }
+
+          // Read HTML file if --html given; pass raw content to route
+          let html: string | undefined;
+          if (opts.html) {
+            try {
+              html = readFileSync(opts.html, "utf-8");
+            } catch (err) {
+              log.error(
+                `Failed to read --html ${opts.html}: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              process.exitCode = 1;
+              return;
+            }
+          }
+
+          // Read attachments and base64-encode their content for the JSON
+          // wire to the platform proxy.
+          let attachments:
+            | { filename: string; content_type: string; content: string }[]
+            | undefined;
+          if (opts.attach && opts.attach.length > 0) {
+            attachments = [];
+            for (const path of opts.attach) {
+              try {
+                const data = readFileSync(path);
+                attachments.push({
+                  filename: basename(path),
+                  content_type: guessMimeType(path),
+                  content: data.toString("base64"),
+                });
+              } catch (err) {
+                log.error(
+                  `Failed to read --attach ${path}: ${err instanceof Error ? err.message : String(err)}`,
+                );
+                process.exitCode = 1;
+                return;
+              }
+            }
+          }
+
+          const params: Record<string, unknown> = { to, text };
+          if (opts.subject) {
+            params.subject = opts.subject;
+          }
+          if (html) {
+            params.html = html;
+          }
+          if (opts.cc && opts.cc.length > 0) {
+            params.cc = opts.cc;
+          }
+          if (opts.bcc && opts.bcc.length > 0) {
+            params.bcc = opts.bcc;
+          }
+          if (attachments && attachments.length > 0) {
+            params.attachments = attachments;
+          }
+          if (opts.replyTo) {
+            params.reply_to = opts.replyTo;
+          }
+
+          const r = await cliIpcCall<{ delivery_id: string; status: string }>(
+            "email_send",
+            { body: params },
+          );
+          if (!r.ok) {
+            return handleEmailIpcError(
+              { ok: false, error: r.error, statusCode: r.statusCode },
+              cmd,
+            );
+          }
+          const data = r.result!;
+          if (shouldOutputJson(cmd)) {
+            writeOutput(cmd, data);
+          } else {
+            log.info(
+              `✓ Sent to ${to.join(", ")} (delivery_id: ${data.delivery_id})`,
+            );
+          }
+        },
+      );
+
+      subcommand(email, "attachment").action(
+        async (
+          messageId: string,
+          attachmentId: string | undefined,
+          opts: {
+            all?: boolean;
+            output?: string;
+            list?: boolean;
+          },
+          cmd: Command,
+        ) => {
+          if (opts.list) {
+            // List mode — show attachment metadata without downloading
+            const r = await cliIpcCall<{ results: AttachmentMeta[] }>(
+              "email_attachment_list",
+              { queryParams: { messageId } },
+            );
+            if (!r.ok) {
+              return handleEmailIpcError(
+                { ok: false, error: r.error, statusCode: r.statusCode },
+                cmd,
+              );
+            }
+            const data = r.result!;
+            if (shouldOutputJson(cmd)) {
+              writeOutput(cmd, data);
+            } else {
+              const attachments = data.results ?? [];
+              if (attachments.length === 0) {
+                log.info("No attachments for this message.");
+              } else {
+                for (const att of attachments) {
+                  log.info(
+                    `  ${att.id}  ${att.filename}  (${att.content_type}, ${formatBytes(att.size_bytes)})`,
+                  );
+                }
+                log.info(`\n${attachments.length} attachment(s)`);
+              }
+            }
+            return;
+          }
+
+          if (!opts.all && !attachmentId) {
+            log.error(
+              "Specify an attachment ID, or use --all to download all. Use --list to see available.",
+            );
+            process.exitCode = 1;
+            return;
+          }
+
+          // Ensure output directory exists and download attachment(s)
+          const outDir = opts.output ?? ".";
+          try {
+            mkdirSync(outDir, { recursive: true });
+          } catch (err) {
+            log.error(
+              `Failed to create output directory ${outDir}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            process.exitCode = 1;
+            return;
+          }
+
+          try {
+            if (opts.all) {
+              // Download all attachments — list first to get filenames
+              const listR = await cliIpcCall<{ results: AttachmentMeta[] }>(
+                "email_attachment_list",
+                { queryParams: { messageId } },
+              );
+              if (!listR.ok) {
+                return handleEmailIpcError(
+                  {
+                    ok: false,
+                    error: listR.error,
+                    statusCode: listR.statusCode,
+                  },
+                  cmd,
+                );
+              }
+              const attachments = listR.result!.results ?? [];
+              if (attachments.length === 0) {
+                log.error("No attachments for this message.");
+                process.exitCode = 1;
+                return;
+              }
+
+              const downloaded: { filename: string; size_bytes: number }[] = [];
+              for (const att of attachments) {
+                const dest = join(outDir, safeFilename(att.filename));
+                await streamDownloadAttachment(att.id, messageId, dest);
+                downloaded.push({
+                  filename: att.filename,
+                  size_bytes: att.size_bytes,
+                });
+              }
+
+              if (shouldOutputJson(cmd)) {
+                writeOutput(cmd, {
+                  downloaded: downloaded.length,
+                  directory: outDir,
+                  files: downloaded,
+                });
+              } else {
+                log.info(
+                  `✓ Downloaded ${downloaded.length} attachment(s) to ${outDir}`,
+                );
+                for (const f of downloaded) {
+                  log.info(`  - ${f.filename} (${formatBytes(f.size_bytes)})`);
+                }
+              }
+            } else {
+              // Download single attachment — look up metadata from the list first
+              const listR = await cliIpcCall<{ results: AttachmentMeta[] }>(
+                "email_attachment_list",
+                { queryParams: { messageId } },
+              );
+              if (!listR.ok) {
+                return handleEmailIpcError(
+                  {
+                    ok: false,
+                    error: listR.error,
+                    statusCode: listR.statusCode,
+                  },
+                  cmd,
+                );
+              }
+              const meta = (listR.result!.results ?? []).find(
+                (a) => a.id === attachmentId,
+              );
+              if (!meta) {
+                log.error(`Attachment not found: ${attachmentId}`);
+                process.exitCode = 2;
+                return;
+              }
+              const dest = join(outDir, safeFilename(meta.filename));
+              await streamDownloadAttachment(attachmentId!, messageId, dest);
+
+              if (shouldOutputJson(cmd)) {
+                writeOutput(cmd, {
+                  filename: meta.filename,
+                  size_bytes: meta.size_bytes,
+                  saved: dest,
+                });
+              } else {
+                log.info(
+                  `✓ Downloaded ${meta.filename} (${formatBytes(meta.size_bytes)})`,
+                );
+              }
+            }
+          } catch (err) {
+            log.error(
+              `Failed to download attachment: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            process.exitCode = 1;
+            return;
+          }
+        },
+      );
+    },
+  });
+}
+
+interface AttachmentMeta {
+  id: string;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  content_id: string;
+  created_at: string;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function safeFilename(name: string): string {
+  // Strip path separators and null bytes — keep the basename only
+  return basename(name).replace(/[\x00/\\]/g, "_") || "attachment";
+}
+
+async function streamDownloadAttachment(
+  attachmentId: string,
+  messageId: string,
+  dest: string,
+): Promise<void> {
+  const r = await cliIpcCallStream("email_attachment_get", {
+    queryParams: { messageId, attachmentId },
+  });
+  if (!r.ok) {
+    throw new Error(r.error ?? "Stream failed");
+  }
+
+  const fileStream = createWriteStream(dest);
+  const reader = r.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      await new Promise<void>((resolve, reject) =>
+        fileStream.write(value, (err) => (err ? reject(err) : resolve())),
+      );
+    }
+    await new Promise<void>((resolve, reject) =>
+      fileStream.close((err) => (err ? reject(err) : resolve())),
+    );
+  } catch (err) {
+    r.abort();
+    fileStream.destroy();
+    throw err;
+  }
+}

@@ -1,0 +1,359 @@
+import { z } from "zod";
+
+import { TTS_PROVIDER_IDS } from "../../tts/types.js";
+import { baseLanguageSubtag } from "../../util/language-subtag.js";
+import {
+  DEFAULT_ELEVENLABS_VOICE_ID,
+  VALID_CONVERSATION_TIMEOUTS,
+} from "./elevenlabs.js";
+
+/**
+ * Per-provider config schemas nested under `services.tts.providers.<id>`.
+ *
+ * Each provider's schema is the full provider-specific config (voice ID,
+ * model overrides, tuning params, etc.). These are identical to the
+ * legacy top-level schemas (`elevenlabs.*`, `fishAudio.*`) so that
+ * migration can copy values 1:1.
+ */
+
+/**
+ * Optional per-language voice override map for a TTS provider block.
+ * Keys parse to lowercase base language subtags (e.g. "hi", "ja"); values
+ * are provider voice identifiers. Live voice consults the map when a turn's
+ * spoken language is known and no explicit voice was requested.
+ *
+ * Key normalization happens at parse time so runtime lookups are a single
+ * exact match: each key is lowercased, cut at the first `-`/`_`, and
+ * trimmed ("hi-IN" and "HI" both store as "hi"). Keys that normalize to
+ * the empty string are dropped; when two keys normalize to the same
+ * subtag, the first entry wins.
+ */
+function languageVoicesSchema(providerId: string, valuesDescription: string) {
+  return z
+    .record(
+      z.string({
+        error: `services.tts.providers.${providerId}.languageVoices keys must be strings`,
+      }),
+      z.string({
+        error: `services.tts.providers.${providerId}.languageVoices values must be strings`,
+      }),
+      {
+        error: `services.tts.providers.${providerId}.languageVoices must be an object mapping language subtags to voice identifiers`,
+      },
+    )
+    .transform((map) => {
+      const normalized = new Map<string, string>();
+      for (const [key, voice] of Object.entries(map)) {
+        const subtag = baseLanguageSubtag(key);
+        if (!subtag || normalized.has(subtag)) {
+          continue;
+        }
+        normalized.set(subtag, voice);
+      }
+      return Object.fromEntries(normalized);
+    })
+    .optional()
+    .describe(
+      "Per-language voice overrides for live voice. Keys are normalized on " +
+        'save to lowercase base language subtags ("hi-IN" and "HI" both ' +
+        `store as "hi"); ${valuesDescription} ` +
+        "Applied when the turn's spoken language matches an entry and no " +
+        "explicit voice is requested.",
+    );
+}
+
+export const TtsElevenLabsProviderConfigSchema = z
+  .object({
+    voiceId: z
+      .string({
+        error: "services.tts.providers.elevenlabs.voiceId must be a string",
+      })
+      .transform((v) => v || DEFAULT_ELEVENLABS_VOICE_ID)
+      .default(DEFAULT_ELEVENLABS_VOICE_ID)
+      .describe("ElevenLabs voice ID for text-to-speech"),
+    voiceModelId: z
+      .string({
+        error:
+          "services.tts.providers.elevenlabs.voiceModelId must be a string",
+      })
+      .default("")
+      .describe(
+        "ElevenLabs model ID override (leave empty to use the default model)",
+      ),
+    speed: z
+      .number({
+        error: "services.tts.providers.elevenlabs.speed must be a number",
+      })
+      .min(0.7, "services.tts.providers.elevenlabs.speed must be >= 0.7")
+      .max(1.2, "services.tts.providers.elevenlabs.speed must be <= 1.2")
+      .default(1.0)
+      .describe(
+        "Speech playback speed multiplier (0.7 = slower, 1.2 = faster)",
+      ),
+    stability: z
+      .number({
+        error: "services.tts.providers.elevenlabs.stability must be a number",
+      })
+      .min(0, "services.tts.providers.elevenlabs.stability must be >= 0")
+      .max(1, "services.tts.providers.elevenlabs.stability must be <= 1")
+      .default(0.5)
+      .describe(
+        "Voice stability — higher values produce more consistent speech, lower values add expressiveness",
+      ),
+    similarityBoost: z
+      .number({
+        error:
+          "services.tts.providers.elevenlabs.similarityBoost must be a number",
+      })
+      .min(0, "services.tts.providers.elevenlabs.similarityBoost must be >= 0")
+      .max(1, "services.tts.providers.elevenlabs.similarityBoost must be <= 1")
+      .default(0.75)
+      .describe(
+        "How closely the output matches the original voice — higher values increase similarity",
+      ),
+    conversationTimeoutSeconds: z
+      .number({
+        error:
+          "services.tts.providers.elevenlabs.conversationTimeoutSeconds must be a number",
+      })
+      .refine(
+        (v) =>
+          VALID_CONVERSATION_TIMEOUTS.includes(
+            v as (typeof VALID_CONVERSATION_TIMEOUTS)[number],
+          ),
+        {
+          message: `services.tts.providers.elevenlabs.conversationTimeoutSeconds must be one of: ${VALID_CONVERSATION_TIMEOUTS.join(", ")}`,
+        },
+      )
+      .default(30)
+      .describe("Seconds of silence before voice conversation auto-ends"),
+    languageVoices: languageVoicesSchema(
+      "elevenlabs",
+      "values are ElevenLabs voice IDs.",
+    ),
+  })
+  .describe("ElevenLabs provider configuration under services.tts");
+
+export type TtsElevenLabsProviderConfig = z.infer<
+  typeof TtsElevenLabsProviderConfigSchema
+>;
+
+export const TtsFishAudioProviderConfigSchema = z
+  .object({
+    referenceId: z
+      .string({
+        error: "services.tts.providers.fish-audio.referenceId must be a string",
+      })
+      .default("")
+      .describe("Fish Audio voice/clone reference ID"),
+    chunkLength: z
+      .number({
+        error: "services.tts.providers.fish-audio.chunkLength must be a number",
+      })
+      .int("services.tts.providers.fish-audio.chunkLength must be an integer")
+      .min(100, "services.tts.providers.fish-audio.chunkLength must be >= 100")
+      .max(300, "services.tts.providers.fish-audio.chunkLength must be <= 300")
+      .default(200)
+      .describe("Text chunk size for streaming synthesis"),
+    format: z
+      .enum(["mp3", "wav", "opus"], {
+        error:
+          "services.tts.providers.fish-audio.format must be one of: mp3, wav, opus",
+      })
+      .default("mp3")
+      .describe("Output audio format"),
+    latency: z
+      .enum(["normal", "balanced"], {
+        error:
+          "services.tts.providers.fish-audio.latency must be one of: normal, balanced",
+      })
+      .default("normal")
+      .describe(
+        "Latency/quality tradeoff for Fish Audio S2 synthesis. 'normal' prioritizes lower latency; 'balanced' trades latency for higher quality.",
+      ),
+    speed: z
+      .number({
+        error: "services.tts.providers.fish-audio.speed must be a number",
+      })
+      .min(0.5, "services.tts.providers.fish-audio.speed must be >= 0.5")
+      .max(2.0, "services.tts.providers.fish-audio.speed must be <= 2.0")
+      .default(1.0)
+      .describe("Playback speed multiplier (0.5 = slower, 2.0 = faster)"),
+  })
+  .describe("Fish Audio provider configuration under services.tts");
+
+export type TtsFishAudioProviderConfig = z.infer<
+  typeof TtsFishAudioProviderConfigSchema
+>;
+
+export const TtsDeepgramProviderConfigSchema = z
+  .object({
+    model: z
+      .string({
+        error: "services.tts.providers.deepgram.model must be a string",
+      })
+      .transform((v) => v || "aura-asteria-en")
+      .default("aura-asteria-en")
+      .describe("Deepgram TTS model identifier"),
+    format: z
+      .enum(["mp3", "wav", "opus"], {
+        error:
+          "services.tts.providers.deepgram.format must be one of: mp3, wav, opus",
+      })
+      .default("mp3")
+      .describe("Output audio format for call/runtime playback"),
+    languageVoices: languageVoicesSchema(
+      "deepgram",
+      "values are Deepgram TTS model identifiers (e.g. an aura-2 voice).",
+    ),
+  })
+  .describe("Deepgram provider configuration under services.tts");
+
+export type TtsDeepgramProviderConfig = z.infer<
+  typeof TtsDeepgramProviderConfigSchema
+>;
+
+export const TtsXaiProviderConfigSchema = z
+  .object({
+    voiceId: z
+      .string({
+        error: "services.tts.providers.xai.voiceId must be a string",
+      })
+      .transform((v) => v || "eve")
+      .default("eve")
+      .describe(
+        "xAI voice ID — one of: eve, ara, rex, sal, leo (case-insensitive)",
+      ),
+    language: z
+      .string({
+        error: "services.tts.providers.xai.language must be a string",
+      })
+      .transform((v) => v || "auto")
+      .default("auto")
+      .describe(
+        "BCP-47 language code (e.g. 'en-US') or 'auto' for auto-detection",
+      ),
+    format: z
+      .enum(["mp3", "wav"], {
+        error: "services.tts.providers.xai.format must be one of: mp3, wav",
+      })
+      .default("mp3")
+      .describe("Output audio format for call/runtime playback"),
+    sampleRate: z
+      .number({
+        error: "services.tts.providers.xai.sampleRate must be a number",
+      })
+      .int("services.tts.providers.xai.sampleRate must be an integer")
+      .refine((v) => [8000, 16000, 22050, 24000, 44100, 48000].includes(v), {
+        message:
+          "services.tts.providers.xai.sampleRate must be one of: 8000, 16000, 22050, 24000, 44100, 48000",
+      })
+      .default(24000)
+      .describe("Output sample rate in Hz"),
+    bitRate: z
+      .number({
+        error: "services.tts.providers.xai.bitRate must be a number",
+      })
+      .int("services.tts.providers.xai.bitRate must be an integer")
+      .refine((v) => [32000, 64000, 96000, 128000, 192000].includes(v), {
+        message:
+          "services.tts.providers.xai.bitRate must be one of: 32000, 64000, 96000, 128000, 192000",
+      })
+      .default(128000)
+      .describe("MP3 bit rate (ignored for non-MP3 codecs)"),
+  })
+  .describe("xAI provider configuration under services.tts");
+
+export type TtsXaiProviderConfig = z.infer<typeof TtsXaiProviderConfigSchema>;
+
+/**
+ * Vellum managed provider configuration under `services.tts.providers`.
+ */
+const TtsVellumProviderConfigSchema = z
+  .object({
+    model: z
+      .string()
+      .optional()
+      .describe(
+        "Managed TTS voice model (e.g. aura-2-thalia-en). Unset means the platform's default voice. The platform rejects voices it does not offer.",
+      ),
+    languageVoices: languageVoicesSchema(
+      "vellum",
+      "values are managed TTS voice models (e.g. aura-2-thalia-en) and must " +
+        "be voices offered by the platform rate card: an unpriced model is " +
+        "rejected by the relay (missing_price), the same contract as " +
+        "services.tts.providers.vellum.model.",
+    ),
+  })
+  .describe("Vellum managed provider configuration under services.tts");
+
+export type TtsVellumProviderConfig = z.infer<
+  typeof TtsVellumProviderConfigSchema
+>;
+
+const TtsProvidersSchema = z.object({
+  elevenlabs: TtsElevenLabsProviderConfigSchema.default(
+    TtsElevenLabsProviderConfigSchema.parse({}),
+  ),
+  "fish-audio": TtsFishAudioProviderConfigSchema.default(
+    TtsFishAudioProviderConfigSchema.parse({}),
+  ),
+  deepgram: TtsDeepgramProviderConfigSchema.default(
+    TtsDeepgramProviderConfigSchema.parse({}),
+  ),
+  xai: TtsXaiProviderConfigSchema.default(TtsXaiProviderConfigSchema.parse({})),
+  vellum: TtsVellumProviderConfigSchema.default(
+    TtsVellumProviderConfigSchema.parse({}),
+  ),
+});
+export type TtsProviders = z.infer<typeof TtsProvidersSchema>;
+
+// ---------------------------------------------------------------------------
+// Catalog-completeness guard
+// ---------------------------------------------------------------------------
+// Ensures every provider in the catalog has a corresponding key in
+// TtsProvidersSchema. If a new provider is added to the catalog without a
+// schema entry, this fires at module-load time so the oversight is caught
+// immediately rather than at runtime when a user selects the provider.
+// ---------------------------------------------------------------------------
+const schemaKeys = new Set(Object.keys(TtsProvidersSchema.shape));
+for (const id of TTS_PROVIDER_IDS) {
+  if (!schemaKeys.has(id)) {
+    throw new Error(
+      `TTS provider "${id}" exists in the catalog but has no schema entry ` +
+        `in TtsProvidersSchema. Add a "services.tts.providers.${id}" schema.`,
+    );
+  }
+}
+const catalogKeys = new Set<string>(TTS_PROVIDER_IDS);
+for (const id of schemaKeys) {
+  if (!catalogKeys.has(id)) {
+    throw new Error(
+      `TTS provider "${id}" has a schema entry in TtsProvidersSchema but ` +
+        `is not registered in the provider catalog. Add it to ` +
+        `provider-catalog.ts or remove it from TtsProvidersSchema.`,
+    );
+  }
+}
+
+/**
+ * Canonical TTS service configuration.
+ *
+ * `provider` is the only axis: `"vellum"` synthesizes through the platform,
+ * billed to Vellum credits; any other provider uses the user's own API key.
+ */
+export const TtsServiceSchema = z
+  .object({
+    provider: z
+      .enum(TTS_PROVIDER_IDS, {
+        error: `services.tts.provider must be one of: ${TTS_PROVIDER_IDS.join(", ")}`,
+      })
+      .default("elevenlabs")
+      .describe("Active TTS provider used for speech synthesis"),
+    providers: TtsProvidersSchema.default(TtsProvidersSchema.parse({})),
+  })
+  .describe(
+    "Text-to-speech service configuration — provider selection and per-provider settings",
+  );
+
+export type TtsService = z.infer<typeof TtsServiceSchema>;
